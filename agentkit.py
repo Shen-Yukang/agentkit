@@ -644,7 +644,9 @@ def skipped_review(pr: str, dry_run: bool) -> int:
 
 
 ERROR_HINTS = {
-    "billing_error": "API 账户额度不足：到 Anthropic Console 的 Billing 页面充值，或者改用 Claude 订阅的 OAuth token（claude_code_oauth_token）。",
+    "billing_error": ("这个 key 所属的组织额度不足。如果 Console 里明明有额度，多半是 key 建在了另一个组织下："
+                      "在 Console 左上角切到有额度的组织，在那里新建 key，更新仓库密钥 ANTHROPIC_API_KEY。"
+                      "也可以改用 Claude 订阅的 OAuth token（claude_code_oauth_token）。"),
     "authentication_error": "API key 无效：检查仓库密钥 ANTHROPIC_API_KEY 是否填对。",
     "permission_error": "这个 API key 没有调用该模型的权限：检查账户的模型权限。",
     "rate_limit_error": "触发了限流：稍后在 Actions 页面重跑这个任务。",

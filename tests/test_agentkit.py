@@ -190,7 +190,7 @@ class ExplainFailureTest(unittest.TestCase):
                                     capture_output=True, text=True, env=env_without_hook_dir())
         self.assertEqual(result.returncode, 0)
         self.assertIn("Credit balance is too low", result.stdout)
-        self.assertIn("充值", result.stdout)
+        self.assertIn("另一个组织", result.stdout)
 
 
 class HookTest(unittest.TestCase):
