@@ -83,6 +83,7 @@ AI 审查（GitHub 上的自动审查，或本地的 `/selfcheck`）都按这份
 
 最后那段 `ai-review-result` 是给机器读的（任务平台用它更新状态），必须是一行合法的 JSON：
 
+- `round` 是整数：GitHub 上第几轮就填几，本地自查填 0。
 - `scores` 每项是 1–5 的整数；“符合需求”无法判断时填 `null`。
 - `risk_level` 只能是 `low`、`medium`、`high`。
 - `reviewers_needed` 是 0、1 或 2。

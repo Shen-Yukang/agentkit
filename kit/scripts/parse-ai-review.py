@@ -15,6 +15,9 @@ SCORE_KEYS = ("requirement", "evidence", "risk", "readability")
 
 def validate(result):
     errors = []
+    round_ = result.get("round")
+    if isinstance(round_, bool) or not isinstance(round_, int) or round_ < 0:
+        errors.append("round must be a non-negative integer (0 for a local self-check)")
     scores = result.get("scores")
     if not isinstance(scores, dict):
         errors.append("scores must be an object")
