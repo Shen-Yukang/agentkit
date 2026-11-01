@@ -171,6 +171,28 @@ class DecisionTest(unittest.TestCase):
         self.assertIn("`agentkit.toml`", comment)
 
 
+class ExplainFailureTest(unittest.TestCase):
+    BILLING = {"type": "assistant", "message": {"content": [{"type": "text", "text": "Credit balance is too low"}]},
+               "error": "billing_error", "is_api_error_message": True, "api_error_status": 400}
+
+    def test_finds_api_errors_in_a_json_array_or_json_lines(self):
+        as_array = json.dumps([{"type": "system", "subtype": "init"}, self.BILLING, {"type": "result", "is_error": True}])
+        self.assertEqual(ak.api_errors(as_array), [("billing_error", "Credit balance is too low")])
+        as_lines = "\n".join(json.dumps(r) for r in ({"type": "system"}, self.BILLING))
+        self.assertEqual(ak.api_errors(as_lines), [("billing_error", "Credit balance is too low")])
+        self.assertEqual(ak.api_errors(json.dumps([{"type": "result", "is_error": False}])), [])
+
+    def test_dry_run_explains_the_fix(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "out.json"
+            path.write_text(json.dumps([self.BILLING]))
+            result = subprocess.run([sys.executable, str(SCRIPT), "explain-failure", "--file", str(path), "--dry-run"],
+                                    capture_output=True, text=True, env=env_without_hook_dir())
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Credit balance is too low", result.stdout)
+        self.assertIn("充值", result.stdout)
+
+
 class HookTest(unittest.TestCase):
     def setUp(self):
         self.repo = TempRepo({

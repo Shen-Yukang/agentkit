@@ -83,6 +83,7 @@ jobs:
         with:
           name: agentkit-checks
       - uses: anthropics/claude-code-action@v1
+        id: claude
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           prompt: |
@@ -99,6 +100,11 @@ jobs:
             不要发评论，不要修改代码，也不要批准或拒绝 PR；评论由后面的步骤发出。
           claude_args: |
             --max-turns 30 --allowedTools "Read,Grep,Glob,Write,Bash(python3 .agentkit/agentkit.py context:*),Bash(python3 .agentkit/agentkit.py validate:*),Bash(gh pr view:*),Bash(gh pr diff:*)"
+      - name: Explain why the AI review did not run
+        if: failure() && steps.claude.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .agentkit/agentkit.py explain-failure --pr "${{ github.event.pull_request.number }}" --file "$RUNNER_TEMP/claude-execution-output.json"
       - name: Post the review and apply the gate
         env:
           GH_TOKEN: ${{ github.token }}

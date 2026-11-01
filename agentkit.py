@@ -643,6 +643,70 @@ def skipped_review(pr: str, dry_run: bool) -> int:
     return 0
 
 
+ERROR_HINTS = {
+    "billing_error": "API 账户额度不足：到 Anthropic Console 的 Billing 页面充值，或者改用 Claude 订阅的 OAuth token（claude_code_oauth_token）。",
+    "authentication_error": "API key 无效：检查仓库密钥 ANTHROPIC_API_KEY 是否填对。",
+    "permission_error": "这个 API key 没有调用该模型的权限：检查账户的模型权限。",
+    "rate_limit_error": "触发了限流：稍后在 Actions 页面重跑这个任务。",
+    "overloaded_error": "服务暂时过载：稍后在 Actions 页面重跑这个任务。",
+}
+
+
+def api_errors(text: str) -> list[tuple[str, str]]:
+    """Find API errors in claude-code-action's execution output (JSON array or JSON lines)."""
+    try:
+        records = [json.loads(text)]
+    except json.JSONDecodeError:
+        records = []
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+    found: list[tuple[str, str]] = []
+
+    def visit(obj) -> None:
+        if isinstance(obj, list):
+            for item in obj:
+                visit(item)
+        elif isinstance(obj, dict):
+            if obj.get("is_api_error_message") or (isinstance(obj.get("error"), str) and obj["error"].endswith("_error")):
+                content = (obj.get("message") or {}).get("content") or obj.get("content") or []
+                texts = [c.get("text", "") for c in content if isinstance(c, dict)] if isinstance(content, list) else []
+                found.append((str(obj.get("error") or "api_error"), " ".join(t for t in texts if t).strip()))
+            for value in obj.values():
+                if isinstance(value, (dict, list)):
+                    visit(value)
+
+    visit(records)
+    return list(dict.fromkeys(found))
+
+
+def cmd_explain_failure(args: argparse.Namespace) -> int:
+    path = Path(args.file)
+    errors = api_errors(path.read_text()) if path.exists() else []
+    lines = ["**agentkit**：AI 审查没有运行完，这次没有审查结果，`agentkit / review` 判为不通过。", ""]
+    if errors:
+        for kind, message in errors[:3]:
+            lines.append(f"- 接口返回 `{kind}`" + (f"：{message}" if message else ""))
+            if kind in ERROR_HINTS:
+                lines.append(f"  - 处理办法：{ERROR_HINTS[kind]}")
+    else:
+        lines.append("- 没有在输出里找到明确的接口错误，请到 Actions 日志里看 Claude 那一步。")
+    lines += ["", "处理好之后，在 Actions 页面重跑这个任务，或者推一个新提交。"]
+    body = "\n".join(lines) + "\n"
+    if args.dry_run or not args.pr:
+        print(body)
+        return 0
+    out = Path("review.failure.md")
+    out.write_text(body)
+    gh("pr", "comment", args.pr, "--body-file", str(out))
+    print("已在 PR 上说明 AI 审查失败的原因。")
+    return 0
+
+
 def cmd_hook(args: argparse.Namespace) -> int:
     root = repo_root()
     cfg = load_config(root)
@@ -684,6 +748,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--comments-file")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_gate)
+    p = sub.add_parser("explain-failure", help="AI 审查没跑起来时，在 PR 上说明原因")
+    p.add_argument("--file", required=True, help="claude-code-action 的执行输出")
+    p.add_argument("--pr")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_explain_failure)
     p = sub.add_parser("hook", help="Claude Code 钩子")
     p.add_argument("event", choices=["pre-edit", "stop"])
     p.set_defaults(func=cmd_hook)
