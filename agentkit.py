@@ -654,6 +654,22 @@ ERROR_HINTS = {
 }
 
 
+# Some API errors arrive with an unhelpful kind; match on the message text too.
+MESSAGE_HINTS = {
+    "not scoped to a workspace": ("这个 key 是组织级的，没有归属到工作区。在 Console 里进入一个工作区（Workspaces → 选中工作区 → API keys）"
+                                  "新建 key，用它更新仓库密钥 ANTHROPIC_API_KEY。"),
+    "credit balance is too low": "billing_error",
+    "invalid x-api-key": "authentication_error",
+}
+
+
+def hint_for(kind: str, message: str) -> str | None:
+    for needle, hint in MESSAGE_HINTS.items():
+        if needle in message.lower():
+            return ERROR_HINTS.get(hint, hint)
+    return ERROR_HINTS.get(kind)
+
+
 def api_errors(text: str) -> list[tuple[str, str]]:
     """Find API errors in claude-code-action's execution output (JSON array or JSON lines)."""
     try:
@@ -693,8 +709,9 @@ def cmd_explain_failure(args: argparse.Namespace) -> int:
     if errors:
         for kind, message in errors[:3]:
             lines.append(f"- 接口返回 `{kind}`" + (f"：{message}" if message else ""))
-            if kind in ERROR_HINTS:
-                lines.append(f"  - 处理办法：{ERROR_HINTS[kind]}")
+            hint = hint_for(kind, message)
+            if hint:
+                lines.append(f"  - 处理办法：{hint}")
     else:
         lines.append("- 没有在输出里找到明确的接口错误，请到 Actions 日志里看 Claude 那一步。")
     lines += ["", "处理好之后，在 Actions 页面重跑这个任务，或者推一个新提交。"]

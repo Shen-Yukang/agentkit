@@ -182,6 +182,11 @@ class ExplainFailureTest(unittest.TestCase):
         self.assertEqual(ak.api_errors(as_lines), [("billing_error", "Credit balance is too low")])
         self.assertEqual(ak.api_errors(json.dumps([{"type": "result", "is_error": False}])), [])
 
+    def test_hints_match_on_message_text(self):
+        self.assertIn("工作区", ak.hint_for("unknown", "API Error: 400 This API key is not scoped to a workspace, so ..."))
+        self.assertIn("另一个组织", ak.hint_for("unknown", "Credit balance is too low"))
+        self.assertIsNone(ak.hint_for("unknown", "something else"))
+
     def test_dry_run_explains_the_fix(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "out.json"
