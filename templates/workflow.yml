@@ -1,0 +1,89 @@
+# 由 agentkit 生成：升级时会被覆盖。项目差异请写在 agentkit.toml。
+#
+# checks：按改动路径运行 agentkit.toml 里配置的检查，失败就不通过。
+# review：新开的 AI 审查这次改动，结果由 agentkit 定稿后发成一条评论、加 risk:* 标签；
+#         有已确认的 Important 问题就不通过。
+# 建议在分支保护里把 “agentkit / checks” 和 “agentkit / review” 设为必须通过。
+# 需要：仓库密钥 ANTHROPIC_API_KEY，并安装 Claude GitHub App。
+
+name: agentkit
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+concurrency:
+  group: agentkit-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run the checks that apply to this change
+        run: python3 .agentkit/agentkit.py checks --base "${{ github.event.pull_request.base.sha }}" --evidence checks.md
+      - name: Keep the evidence for the review job
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentkit-checks
+          path: checks.md
+          if-no-files-found: ignore
+
+  review:
+    needs: checks
+    if: always() && github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: agentkit-checks
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            你是这个 PR 的审查者，没有参与写这段代码。PR 分支已经检出在当前目录。
+
+            1. 运行 `python3 .agentkit/agentkit.py context --for review`，按它列出的顺序读完项目规则和 .agentkit/review-format.md。
+            2. 用 `gh pr view ${{ github.event.pull_request.number }}` 读 PR 描述，加 `--comments` 看之前的审查；用 `gh pr diff ${{ github.event.pull_request.number }}` 读完整改动。
+            3. 自动检查的结果在 checks.md（如果存在），把它当作证据。
+            4. 按 review-format.md 的模板把结果写进 review.md，然后运行 `python3 .agentkit/agentkit.py validate review.md`，不通过就改到通过。
+
+            不要发评论，不要修改代码，也不要批准或拒绝 PR；评论由后面的步骤发出。
+          claude_args: |
+            --max-turns 30 --allowedTools "Read,Grep,Glob,Write,Bash(python3 .agentkit/agentkit.py context:*),Bash(python3 .agentkit/agentkit.py validate:*),Bash(gh pr view:*),Bash(gh pr diff:*)"
+      - name: Post the review and apply the gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 .agentkit/agentkit.py gate --review review.md
+          --pr "${{ github.event.pull_request.number }}"
+          --base "${{ github.event.pull_request.base.sha }}"
+          --head "${{ github.event.pull_request.head.sha }}"

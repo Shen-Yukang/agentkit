@@ -1,84 +1,117 @@
-# Agent 协作工具包（v0）
+# agentkit（v0.2）
 
-把分享里“说清需求 → 先复述 → 先重现 → 一步一证据 → 另一个 AI 审查打分 → 按风险找人”这套做法，变成仓库里可以直接复制的配置。
+一套通用的 kit，加上每个仓库一份配置 `agentkit.toml`。它把“人说清什么算做对 → AI 写 → 另一方验证 → 按风险找人”这条流程，落成仓库里的门禁和证据。
 
-不需要新服务。一个人加 Claude Code 就能用本地部分；GitHub 上的自动审查需要一个 API key。
+**它不做的两件事**：不做审查引擎（审查由 Claude Code 完成，也可以换成现成的审查产品）；不做任务管理（那是任务平台的事）。它负责的是中间这层：配置、门禁、证据。
 
-## 里面有什么
+## 一条原则：能检查的用工具，要判断的用提示词
 
-| 文件 | 做什么 | 对应分享第几页 |
+| 规则 | 放在哪 | 强制程度 |
 |---|---|---|
-| `.github/pull_request_template.md` | PR 描述里必填需求三问和“怎么验证的” | 第 4 页 |
-| `.claude/commands/restate.md` | `/restate`：先复述、确认问题存在、列出要拍板的事 | 第 5 页 |
-| `.claude/commands/repro.md` | `/repro`：先写会失败的测试，不改实现 | 第 6 页 |
-| `.claude/team-workflow.md` | 给 AI 的工作约定：一次一步、每步证据、3 轮上限、什么事要先问 | 第 6 页 |
-| `REVIEW.md` | 审查规则：4 项打分、报问题的规矩、风险等级、输出模板 | 第 7 页 |
-| `.claude/commands/selfcheck.md` | `/selfcheck`：提交前在新对话里按 REVIEW.md 自查 | 第 7、8 页 |
-| `.claude/commands/pr-desc.md` | `/pr-desc`：按模板写 PR 描述，附真实证据 | 第 6 页 |
-| `.github/workflows/ai-review.yml` | 每个 PR 自动审查，发一条带分数和风险的评论，加 `risk:*` 标签 | 第 7、8 页 |
-| `.github/CODEOWNERS.example` | 高风险目录必须有人审 | 第 8 页 |
-| `.claude/settings.json` | 禁止 AI 读 `.env` 和密钥目录 | — |
-| `scripts/parse-ai-review.py` | 从审查评论里取出分数和风险（JSON），给任务平台用 | — |
+| 改动对应的检查都要跑、要通过 | CI 的 `agentkit / checks`，按改动路径挑检查 | 必须通过 |
+| AI 审查要独立、要有证据 | CI 的 `agentkit / review`：新开的 AI 审查，结果由工具定稿、发评论 | 有已确认的 Important 就不通过 |
+| 风险由路径决定，AI 只能往高调 | `agentkit.toml` 的高风险路径 → `risk:*` 标签和建议人审人数 | 工具判定 |
+| 改门禁本身算高风险 | kit 默认：`.github/workflows/**`、`agentkit.toml`、`.agentkit/**`、`.claude/settings.json` | 工具判定 |
+| 第 3 轮还有阻塞问题就找人 | 工具数轮数，加 `needs-human` 标签 | 工具判定 |
+| 受保护路径 AI 不能改 | Claude Code 钩子（编辑前拦截） | 本地拦截 |
+| 结束一轮前检查要过 | Claude Code 钩子（结束前跑必跑的检查，没过就让它接着修） | 本地拦截 |
+| 证据用工具跑出来，不手写 | `agentkit checks` 生成证据表；`/verify`、`/pr-desc` 直接贴它 | 工具生成 |
+| 先复述、先重现、一次一步、3 轮上限 | `/restate`、`/repro` 和 `.agentkit/team-workflow.md` | 提示词（需要判断） |
 
-## 30 分钟接入
-
-**1. 复制到仓库**
+## 装到一个仓库
 
 ```bash
-./install.sh /path/to/your-repo
+python3 agentkit.py init /path/to/repo
 ```
 
-已经存在的文件不会被覆盖，脚本会列出来，需要的话手动合并。`CLAUDE.md` 只会在末尾加一行 `@.claude/team-workflow.md`。在 Claude Code 里运行 `/memory`，能看到 team-workflow.md 已被加载。
+需要 Python 3.11 或以上，不依赖第三方包。会写入这些文件：
 
-**2. 填两处项目信息**
+| 文件 | 归谁 | 升级时 |
+|---|---|---|
+| `agentkit.toml` | 项目 | 不动。只写事实：检查命令、规则文件、受保护和高风险路径 |
+| `CLAUDE.md` | 项目 | 只补引入行。“被纠正过的规则”写在这里 |
+| `.claude/settings.json` | 项目 | 只补 kit 的钩子和读取限制，不动其他设置 |
+| `.agentkit/agentkit.py`、`review-format.md`、`team-workflow.md` | kit | 覆盖 |
+| `.claude/commands/` 下的 5 个命令 | kit | 覆盖（同名但不是 kit 生成的文件会跳过） |
+| `.github/workflows/agentkit.yml` | kit | 覆盖 |
 
-- `.claude/team-workflow.md` 的“项目信息”：跑测试和启动的命令。
-- `REVIEW.md` 的“高风险清单”：你们的计费、权限、数据库等目录。
+升级就是再运行一次 `init`。init 会从 Makefile、package.json、tests 目录猜出检查命令，从 AGENTS.md、CONTRIBUTING.md、REVIEW.md 猜出规则文件；生成的 `agentkit.toml` 请人看一遍。
 
-**3. 打开 GitHub 上的自动审查**
+## agentkit.toml
 
-- 安装 Claude GitHub App（在 Claude Code 里运行 `/install-github-app`，或按官方文档手动安装）。
-- 在仓库 Settings → Secrets 里添加 `ANTHROPIC_API_KEY`。用 Bedrock 或 Vertex 的，按 `ai-review.yml` 里的注释改。
-- 创建三个风险标签：
+```toml
+version = 1
+
+[rules]
+always = ["AGENTS.md"]                    # 写代码时每次都读（引入 CLAUDE.md）
+review = ["REVIEW.md", "CONTRIBUTING.md"] # 审查时额外读；和 kit 的格式冲突时以它们为准
+
+[checks]
+always = ["make check"]                   # 每次都跑；也是结束前钩子跑的检查
+timeout_seconds = 900
+
+[[checks.by_path]]                        # 改到这些路径才加跑
+paths = ["web/**"]
+run = ["npm ci --prefix web && npm test --prefix web"]
+
+[paths]
+protected = ["vendor/shared-contracts/**"]  # AI 不能改；PR 改到就是高风险
+high_risk = ["REVIEW.md", "deployment/"]    # 改到就至少高风险（kit 默认的门禁路径会自动加上）
+
+[risk]
+reviewers = { low = 0, medium = 1, high = 2 }  # 各风险等级建议几个人审
+
+[requirements]
+source = "pr_body"                        # 需求写在哪：pr_body；pmm（后续）
+
+[hooks]
+check_on_stop = true                      # 结束前自动跑 checks.always
+
+[review]
+trusted_authors = ["github-actions[bot]"] # 只认这些账号发的审查结果（用来数轮数）
+```
+
+路径写法：`dir/**` 匹配目录下所有文件；以 `/` 结尾表示目录；不带通配符的写法匹配同名文件或同名目录。
+
+## 命令
+
+| 命令 | 做什么 |
+|---|---|
+| `agentkit.py context [--for review]` | 打印本仓库的配置，给 AI 读 |
+| `agentkit.py checks [--base REF] [--evidence FILE]` | 按改动路径跑检查，输出证据表；有失败就返回非零 |
+| `agentkit.py risk [--base REF]` | 按路径给出风险下限 |
+| `agentkit.py validate FILE` | 检查审查结果的格式 |
+| `agentkit.py gate --review FILE --pr N --base SHA --head SHA` | 定稿审查结果（轮次、head、最终风险、建议人数），发评论、加标签，按阻塞问题给出通过或不通过。加 `--dry-run` 只在本地预览 |
+| `agentkit.py hook pre-edit / stop` | Claude Code 钩子 |
+
+Claude Code 里的命令：`/restate`、`/repro`、`/verify`、`/selfcheck`（请在新对话里运行）、`/pr-desc`。
+
+## 在 GitHub 上启用
+
+1. 安装 Claude GitHub App，在仓库密钥里添加 `ANTHROPIC_API_KEY`。
+2. 开一个小 PR，确认 `agentkit / checks` 和 `agentkit / review` 都正常运行、评论和标签都出现。
+3. 分支保护里把这两项设为必须通过。
+
+不需要换掉现有的 CI：agentkit 的工作流和你们原有的工作流并存。
+
+## 审查结果的格式
+
+AI 按 `.agentkit/review-format.md` 输出，问题分级和 Claude Code Review 一致：Important、Nit、Pre-existing；没验证的问题 `confirmed: false`，不会阻断。评论末尾有一段机器可读的 `ai-review-result`，任务平台可以用它更新任务状态。
+
+## 测试
 
 ```bash
-gh label create risk:low    --color 0E8A16 --description "AI 审查：低风险"
-gh label create risk:medium --color FBCA04 --description "AI 审查：中风险"
-gh label create risk:high   --color D93F0B --description "AI 审查：高风险"
+python3 -m unittest discover -s tests -v
 ```
-
-**4. 分支保护（Settings → Branches）**
-
-- 合入前必须经过 PR。
-- 合入前必须通过你们现有的 CI 检查。不必换成 GitHub Actions，Jenkins 等外部 CI 报回的状态一样可以设为必过。
-- 先不要把 AI 审查设成必过检查：它只提意见。等跑了两周、误报够低再考虑。
-- 想强制高风险目录有人审：把 `CODEOWNERS.example` 改名为 `CODEOWNERS`，并打开“Require review from Code Owners”。
-
-## 日常怎么用
-
-1. 拿到任务：`/restate <需求>`，确认它的理解和要拍板的事。
-2. 修 bug：`/repro`，看到测试失败、确认抓对了问题，再让它改。
-3. 一次一步，每一步看证据。同一个问题 3 轮还不对，换思路。
-4. 提交前：**新开一个对话**，运行 `/selfcheck`。
-5. 写 PR 描述：`/pr-desc <任务号>`。
-6. PR 打开后，AI 审查会自动发一条评论。人只看低分项、它列出的证据和“给人审的人”那一节，再按风险标签决定几个人审。
-7. 每次纠正 AI，就把规则加到 `.claude/team-workflow.md` 最后一节。
-
-## 成本
-
-- 同一个 PR 连续推送时，只保留最新一次审查；草稿 PR 不审。
-- `--max-turns 30` 限制每次审查的步数。可以在 `claude_args` 里加 `--model` 换成更便宜的模型。
-- 第一周先看 Anthropic 控制台里的实际花费，算出平均每个 PR 多少钱，再决定推广到哪些仓库。
 
 ## 已知限制
 
-- 从 fork 来的 PR 拿不到仓库密钥，不会触发审查。
-- 机器人（例如 dependabot）开的 PR 默认不审；需要的话，在 action 里加 `allowed_bots`。
-- 没有仓库写权限的人开的 PR 默认不审。
-- 这个 v0 的工作流还没有在真实的 GitHub 仓库里跑过。第一次接入时，请开一个小 PR 试一下，确认评论和标签都正常。
+- GitHub 上的工作流还没在真实仓库里跑过。“数轮数只认 `github-actions[bot]`”依赖评论由工作流里的步骤发出，这一点要在第一次试跑时确认。
+- 钩子用模拟输入测过，还没在真正的 Claude Code 里触发过。
+- 从 fork 来的 PR 拿不到密钥，审查不会运行。
+- `npm ci` 这类安装步骤需要写在检查命令里；工作流本身只准备了 Python。
 
-## 和任务平台对接（下一步）
+## 下一步
 
-- PR 描述里有任务号，任务平台可以通过 GitHub webhook 知道“哪个任务开了 PR”。
-- 每条 AI 审查评论末尾都有一段机器可读的 `ai-review-result`。任务平台在收到 `issue_comment` 事件时，用 `scripts/parse-ai-review.py` 取出分数、风险和问题列表，更新任务状态，并按 `reviewers_needed` 分派审查人。
-- 再下一步：把任务平台做成 MCP 服务，让 agent 自己领任务、回写复述和证据。
+- v0.3：“先红”检查（PR 新增的测试放到旧代码上必须失败）；根据高风险路径自动生成 CODEOWNERS；打包成 Claude Code 插件和 GitHub 可复用工作流，仓库里只剩配置文件。
+- v0.4：对接任务平台（MCP 服务和 webhook）；每周看指标：有用意见比例、误报、撤回、平均轮数。
