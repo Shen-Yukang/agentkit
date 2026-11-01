@@ -1,0 +1,9 @@
+# 改名为 CODEOWNERS 后生效：改到这些路径的 PR，会自动请对应的人审查。
+# 配合分支保护里的“Require review from Code Owners”，就能强制高风险目录必须有人批准。
+# 路径和 REVIEW.md 的“高风险清单”保持一致。
+
+# /src/billing/        @your-org/billing-owners
+# /src/auth/           @your-org/security
+# /migrations/         @your-org/backend-leads
+# /.github/workflows/  @your-org/infra
+# /REVIEW.md           @your-org/tech-leads

@@ -1,0 +1,48 @@
+# AI 审查：每个 PR 打开或更新时，按 REVIEW.md 审查，发一条带分数和风险的评论。
+# 只提意见，不批准也不拦截合入。
+# 接入前需要：安装 Claude GitHub App，添加仓库密钥 ANTHROPIC_API_KEY，创建 risk:* 标签（见 README）。
+
+name: AI review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+# 同一个 PR 连续推送时，只保留最新一次审查，省钱
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest # 代码敏感时可以换成自己的 runner
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # 用 Bedrock / Vertex 时改成 use_bedrock: "true" 或 use_vertex: "true"，并去掉上面的 key
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            你是这个 PR 的审查者，没有参与写这段代码。PR 分支已经检出在当前目录。
+
+            1. 先完整读一遍仓库根目录的 REVIEW.md，严格按它的规则审查和输出。
+            2. 用 `gh pr view` 读 PR 描述（里面有需求三问和验证方式），用 `gh pr diff` 读改动。需要上下文时读仓库里的文件。
+            3. 用 `gh pr view --comments` 数一下已经有几条带 `ai-review-result` 标记的评论，按 REVIEW.md 的“轮次”规则处理。
+            4. 把审查结果按 REVIEW.md 的输出模板写进文件 review.md，再用 `gh pr comment ${{ github.event.pull_request.number }} --body-file review.md` 发一条评论。只发这一条。
+            5. 按你给的风险等级加标签：`gh pr edit ${{ github.event.pull_request.number }} --add-label risk:low`（或 risk:medium、risk:high），并去掉其他 risk: 标签。标签不存在就跳过这一步。
+
+            不要修改仓库里的代码，不要批准或拒绝 PR。
+          claude_args: |
+            --max-turns 30 --allowedTools "Read,Grep,Glob,Write,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(gh pr edit:*)"
