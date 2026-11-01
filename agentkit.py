@@ -540,7 +540,7 @@ def cmd_checks(args: argparse.Namespace) -> int:
     root = repo_root()
     cfg = load_config(root)
     base = args.base or default_base(root)
-    files = changed_files(root, base)
+    files = changed_files(root, base, worktree=not args.committed_only)
     plan = plan_checks(cfg, files)
     patterns = [p for e in cfg["checks_by_path"] for p in e["paths"]]
     uncovered = [f for f in files if not any(matches(f, p) for p in patterns)] if cfg["checks_by_path"] else []
@@ -640,6 +640,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("checks", help="按改动运行检查，输出证据")
     p.add_argument("--base")
     p.add_argument("--evidence")
+    p.add_argument("--committed-only", action="store_true", help="只看已提交的改动（CI 用）")
     p.set_defaults(func=cmd_checks)
     p = sub.add_parser("risk", help="按路径给出风险下限")
     p.add_argument("--base")

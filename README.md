@@ -78,7 +78,7 @@ trusted_authors = ["github-actions[bot]"] # 只认这些账号发的审查结果
 | 命令 | 做什么 |
 |---|---|
 | `agentkit.py context [--for review]` | 打印本仓库的配置，给 AI 读 |
-| `agentkit.py checks [--base REF] [--evidence FILE]` | 按改动路径跑检查，输出证据表；有失败就返回非零 |
+| `agentkit.py checks [--base REF] [--evidence FILE] [--committed-only]` | 按改动路径跑检查，输出证据表；有失败就返回非零。`--committed-only` 只看已提交的改动（CI 用） |
 | `agentkit.py risk [--base REF]` | 按路径给出风险下限 |
 | `agentkit.py validate FILE` | 检查审查结果的格式 |
 | `agentkit.py gate --review FILE --pr N --base SHA --head SHA` | 定稿审查结果（轮次、head、最终风险、建议人数），发评论、加标签，按阻塞问题给出通过或不通过。加 `--dry-run` 只在本地预览 |
@@ -93,6 +93,8 @@ Claude Code 里的命令：`/restate`、`/repro`、`/verify`、`/selfcheck`（�
 3. 分支保护里把这两项设为必须通过。
 
 不需要换掉现有的 CI：agentkit 的工作流和你们原有的工作流并存。
+
+**PR 不能改自己的门禁**：CI 里两个任务都会先把 `.agentkit/` 和 `agentkit.toml` 换成 base 分支上的版本，再运行检查和门禁。一个 PR 改了配置或脚本，只有合入之后才对后面的 PR 生效；而改动本身按高风险处理。第一次安装 kit 的那个 PR 例外（base 上还没有 kit），工作流会给出警告。
 
 ## 审查结果的格式
 

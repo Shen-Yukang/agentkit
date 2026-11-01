@@ -227,6 +227,12 @@ class ChecksCommandTest(unittest.TestCase):
         self.assertIn("改到 src/a.py", evidence)
         self.assertIn("退出码 3", evidence)
 
+    def test_committed_only_ignores_uncommitted_changes(self):
+        self.repo.write({"src/a.py": "x = 2\n"})
+        committed = self.repo.run("checks", "--base", "main", "--committed-only")
+        self.assertEqual(committed.returncode, 0, committed.stdout + committed.stderr)
+        self.assertIn("改动文件 0 个", committed.stdout)
+
 
 class GateDryRunTest(unittest.TestCase):
     def setUp(self):
