@@ -256,6 +256,17 @@ class GateDryRunTest(unittest.TestCase):
 
     def test_missing_or_malformed_review_fails(self):
         self.assertEqual(self.repo.run("gate", "--review", "nope.md", "--base", "main", "--dry-run").returncode, 1)
+        self.repo.write({"bad.md": "## AI 审查\n没有结果段\n"})
+        self.assertEqual(self.repo.run("gate", "--review", "bad.md", "--pr", "1", "--base", "main", "--dry-run").returncode, 1)
+
+    def test_skipped_review_when_the_pr_changes_its_own_workflow(self):
+        self.repo.write({".github/workflows/agentkit.yml": "name: agentkit\n"})
+        self.repo.git("add", "-A")
+        self.repo.git("commit", "-q", "-m", "change the review workflow")
+        skipped = self.repo.run("gate", "--review", "nope.md", "--pr", "1", "--base", "main", "--dry-run")
+        self.assertEqual(skipped.returncode, 0, skipped.stderr)
+        self.assertIn("needs-human", skipped.stdout)
+        self.assertIn("被跳过", skipped.stdout)
 
 
 class InitTest(unittest.TestCase):

@@ -580,10 +580,12 @@ def cmd_gate(args: argparse.Namespace) -> int:
     cfg = load_config(root)
     text = Path(args.review).read_text() if Path(args.review).exists() else ""
     review, errors = parse_result(text)
+    base = args.base or default_base(root)
+    if errors and not text and args.pr and workflow_changed(root, base, args.head):
+        return skipped_review(args.pr, args.dry_run)
     if errors:
         print("AI 审查没有产出合格的结果，不能放行：\n  " + "\n  ".join(errors), file=sys.stderr)
         return 1
-    base = args.base or default_base(root)
     files = changed_files(root, base, worktree=args.dry_run)
     floor = risk_floor(cfg, files)
     if args.comments_file:
@@ -612,6 +614,32 @@ def cmd_gate(args: argparse.Namespace) -> int:
     if not decision["passed"]:
         print(f"不通过：{len(decision['blockers'])} 个已确认的 Important 问题。", file=sys.stderr)
         return 1
+    return 0
+
+
+WORKFLOW_FILE = ".github/workflows/agentkit.yml"
+
+
+def workflow_changed(root: Path, base: str, head: str | None) -> bool:
+    """claude-code-action skips the review when a PR changes its own workflow file."""
+    diff = subprocess.run(["git", "-C", str(root), "diff", "--quiet", base, head or "HEAD", "--", WORKFLOW_FILE])
+    return diff.returncode == 1
+
+
+def skipped_review(pr: str, dry_run: bool) -> int:
+    body = ("**agentkit**：这个 PR 改了审查工作流本身（`" + WORKFLOW_FILE + "`）。为了防止 PR 改写自己的审查，"
+            "Claude 的审查 action 只在工作流和默认分支一致时运行，所以这次 AI 审查被跳过。\n\n"
+            "按规则，改门禁属于高风险：请至少 1 位负责人审过再合入。合入之后，后面的 PR 会恢复自动审查。")
+    labels = ["risk:high", "needs-human"]
+    if dry_run:
+        print(body)
+        print(json.dumps({"labels": labels, "passed": True, "skipped": True}, ensure_ascii=False))
+        return 0
+    out = Path("review.skipped.md")
+    out.write_text(body + "\n")
+    gh("pr", "comment", pr, "--body-file", str(out))
+    apply_labels(pr, labels)
+    print("AI 审查因工作流改动被跳过：已加 risk:high 和 needs-human，交给人审。")
     return 0
 
 
