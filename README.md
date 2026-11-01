@@ -28,7 +28,7 @@
 ./install.sh /path/to/your-repo
 ```
 
-已经存在的文件不会被覆盖，脚本会列出来，需要的话手动合并。`CLAUDE.md` 只会在末尾加一行 `@.claude/team-workflow.md`。
+已经存在的文件不会被覆盖，脚本会列出来，需要的话手动合并。`CLAUDE.md` 只会在末尾加一行 `@.claude/team-workflow.md`。在 Claude Code 里运行 `/memory`，能看到 team-workflow.md 已被加载。
 
 **2. 填两处项目信息**
 
