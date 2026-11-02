@@ -347,13 +347,18 @@ def default_base(root: Path) -> str:
     return "HEAD"
 
 
+def git_paths(root: Path, command: str, *args: str) -> list[str]:
+    """File names from git, NUL-separated so names with spaces or non-ASCII characters come through intact."""
+    return [p for p in git(root, command, "-z", *args).split("\0") if p]
+
+
 def changed_files(root: Path, base: str, worktree: bool = True) -> list[str]:
     files: set[str] = set()
     if base != "HEAD":
-        files |= set(git(root, "diff", "--name-only", f"{base}...HEAD").split())
+        files |= set(git_paths(root, "diff", "--name-only", f"{base}...HEAD"))
     if worktree:
-        files |= set(git(root, "diff", "--name-only", "HEAD").split())
-        files |= set(git(root, "ls-files", "--others", "--exclude-standard").split())
+        files |= set(git_paths(root, "diff", "--name-only", "HEAD"))
+        files |= set(git_paths(root, "ls-files", "--others", "--exclude-standard"))
     return sorted(files)
 
 
@@ -654,6 +659,10 @@ def current_task(root: Path, cfg: dict, explicit: str | None = None, base: str |
         hit = ids_in(branch, ids)
         if len(hit) == 1:
             return hit[0], f"分支名 {branch}"
+        if not hit:  # e.g. branch names WIP-16 and the only card under it is WIP-16-2
+            family = [i for i in ids if "-" in i and ids_in(branch, [i.rsplit("-", 1)[0]])]
+            if len(family) == 1:
+                return family[0], f"分支名 {branch}（同一需求下唯一的任务卡）"
         changed = [Path(f).stem for f in card_files(cfg, changed_files(root, base or default_base(root)))]
     except subprocess.CalledProcessError:
         return None, ""
@@ -1008,16 +1017,18 @@ def unconfirmed_task(root: Path, cfg: dict) -> tuple[str, str] | None:
     return task_id, os.path.relpath(path, root)
 
 
+def kit_local(rel: str) -> bool:
+    """This clone's own kit state and outputs (.agentkit/*.local.md): never code, never committed."""
+    return rel.startswith(".agentkit/") and rel.endswith(".local.md")
+
+
 def hook_pre_edit(root: Path, cfg: dict, payload: dict) -> int:
     tool_input = payload.get("tool_input") or {}
     path = tool_input.get("file_path") or tool_input.get("notebook_path")
     if not path:
         return 0
-    if os.path.isabs(path):
-        rel = os.path.relpath(Path(path).resolve(), root.resolve())
-    else:
-        rel = path
-    rel = rel.replace(os.sep, "/")
+    target = Path(path) if os.path.isabs(path) else root / path
+    rel = os.path.relpath(target.resolve(), root.resolve()).replace(os.sep, "/")  # "a/../vendor/x" is still vendor/x
     if rel.startswith(".."):
         return 0
     hit = [p for p in cfg["protected"] if matches(rel, p)]
@@ -1034,7 +1045,12 @@ def hook_pre_edit(root: Path, cfg: dict, payload: dict) -> int:
                   "你可以写复述、列出要拍板的事，然后停下请人确认。", file=sys.stderr)
             return 2
         return 0
-    if cfg["block_before_confirm"] and rel != POINTER:
+    if cfg["block_before_confirm"] and not kit_local(rel):
+        if cfg["tasks_required"] and not current_task(root, cfg)[0]:
+            print(f"agentkit：本仓库要求每个改动都有任务卡（agentkit.toml 的 tasks.required），现在没有当前任务卡，先别改代码。"
+                  f"先运行 `{CLI} task new <任务号> <标题>`，把复述写进任务卡，请人确认；"
+                  f"已有任务卡就请人运行 `{CLI} task use <任务号>`。", file=sys.stderr)
+            return 2
         pending = unconfirmed_task(root, cfg)
         if pending:
             task_id, card = pending
@@ -1056,9 +1072,46 @@ def handoff_missing(root: Path, cfg: dict) -> str | None:
     return card if code and card not in dirty else None
 
 
+SESSIONS = ".agentkit/sessions.local.md"  # "<session id> <working tree fingerprint at session start>" per line
+
+
+def tree_fingerprint(root: Path) -> str:
+    """Changes in the working tree, including untracked files; .agentkit/*.local.md are ignored by git."""
+    digest = hashlib.sha256(git(root, "diff", "HEAD", "--binary").encode())
+    for name in git_paths(root, "ls-files", "--others", "--exclude-standard"):
+        path = root / name
+        if path.is_file() and not kit_local(name):  # the kit's own notes, even where .gitignore misses them
+            stat = path.stat()
+            digest.update(f"{name}\0{stat.st_size}\0{stat.st_mtime_ns}\0".encode())
+    return digest.hexdigest()[:16]
+
+
+def session_baseline(root: Path, session_id: str) -> str | None:
+    path = root / SESSIONS
+    if not session_id or not path.exists():
+        return None
+    for line in path.read_text().splitlines():
+        sid, _, fingerprint = line.partition(" ")
+        if sid == session_id:
+            return fingerprint
+    return None
+
+
+def note_session_start(root: Path, session_id: str) -> None:
+    if not session_id:
+        return
+    path = root / SESSIONS
+    lines = [l for l in (path.read_text().splitlines() if path.exists() else []) if not l.startswith(session_id + " ")]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines[-49:] + [f"{session_id} {tree_fingerprint(root)}"]) + "\n")
+
+
 def hook_stop(root: Path, cfg: dict, payload: dict) -> int:
-    if payload.get("stop_hook_active") or not git(root, "status", "--porcelain").strip():
+    if payload.get("stop_hook_active") or os.environ.get("AGENTKIT_REVIEW") or not git(root, "status", "--porcelain").strip():
         return 0
+    baseline = session_baseline(root, payload.get("session_id", ""))
+    if baseline is not None and baseline == tree_fingerprint(root):
+        return 0  # this session changed nothing (a reviewer, a question); the dirty tree is someone else's work
     parts: list[str] = []
     if cfg["check_on_stop"] and cfg["checks_always"]:
         results = run_checks(root, [(c, "每次都跑") for c in cfg["checks_always"]], min(cfg["timeout"], 300))
@@ -1078,7 +1131,10 @@ def hook_stop(root: Path, cfg: dict, payload: dict) -> int:
     return 2
 
 
-def hook_session_start(root: Path, cfg: dict) -> int:
+def hook_session_start(root: Path, cfg: dict, payload: dict | None = None) -> int:
+    note_session_start(root, (payload or {}).get("session_id", ""))
+    if os.environ.get("AGENTKIT_REVIEW"):
+        return 0  # reviewers get the task cards in their prompt
     lines = ["agentkit：本仓库按任务卡协作，流程见 AGENTS.md 和 .agentkit/team-workflow.md。"]
     task_id, how = current_task(root, cfg)
     if task_id:
@@ -1093,12 +1149,16 @@ def hook_session_start(root: Path, cfg: dict) -> int:
 
 def hook_pre_commit(root: Path, cfg: dict) -> int:
     """git pre-commit: works for every agent and every person, not just Claude Code."""
-    staged = git(root, "diff", "--cached", "--name-only").split()
+    staged = git_paths(root, "diff", "--cached", "--name-only")
     code = [f for f in staged if not f.startswith(tasks_prefix(cfg))]
     if not code:
         return 0
     task_id, _ = current_task(root, cfg)
     if not task_id:
+        if cfg["tasks_required"]:
+            print(f"agentkit：本仓库要求每个改动都有任务卡（agentkit.toml 的 tasks.required），这次提交改了代码，但没有当前任务卡。"
+                  f"先运行 `{CLI} task new <任务号> <标题>` 并请人确认，或用 `{CLI} task use <任务号>` 指定。", file=sys.stderr)
+            return 1
         print(f"agentkit 提醒：这次提交改了代码，但没有当前任务卡（`{CLI} task show`）。", file=sys.stderr)
         return 0
     rel = os.path.relpath(card_path(root, cfg, task_id), root).replace(os.sep, "/")
@@ -1724,26 +1784,36 @@ def read_limited(path: Path, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + f"\n\n（后面还有 {len(text) - limit} 个字符，已截断）"
 
 
+DIFF_FILE_RE = re.compile(r"(?m)^diff --git a/(.+?) b/")
+
+
 def review_diff(root: Path, base: str, committed_only: bool) -> str:
+    plain = ("-c", "core.quotepath=false")  # file names as they are, not octal escapes
     if base == "HEAD":
-        diff = git(root, "diff", "HEAD")
+        diff = git(root, *plain, "diff", "HEAD")
     else:
         merge_base = git(root, "merge-base", base, "HEAD").strip()
-        diff = git(root, "diff", merge_base, "HEAD") if committed_only else git(root, "diff", merge_base)
+        diff = git(root, *plain, "diff", merge_base, "HEAD") if committed_only else git(root, *plain, "diff", merge_base)
+    if len(diff) > MAX_DIFF_CHARS:
+        kept = diff[:MAX_DIFF_CHARS]
+        seen = set(DIFF_FILE_RE.findall(kept))
+        cut = [f for f in dict.fromkeys(DIFF_FILE_RE.findall(diff)) if f not in seen]
+        diff = kept + f"\n\n（diff 太长，后面 {len(diff) - MAX_DIFF_CHARS} 个字符已截断，最后一个附上的文件可能不完整。"
+        if cut:
+            diff += "下面这些文件的改动没有附上：\n" + "\n".join(f"- {f}" for f in cut) + "\n"
+        diff += "能运行命令的话自己看完整改动。）\n"
     if not committed_only:
         shown, skipped = 0, []
-        for name in git(root, "ls-files", "--others", "--exclude-standard").splitlines():
+        for name in git_paths(root, "ls-files", "--others", "--exclude-standard"):
             path = root / name
-            if shown < 10 and path.is_file() and path.stat().st_size < 20_000:
+            if shown < 10 and len(diff) < MAX_DIFF_CHARS and path.is_file() and path.stat().st_size < 20_000:
                 diff += f"\n新文件（还没加入 git）：{name}\n```\n{path.read_text(errors='ignore')}\n```\n"
                 shown += 1
             else:
                 skipped.append(name)
         if skipped:
-            diff += ("\n还没加入 git 的新文件里，下面这些没有附上内容（超过 10 个，或单个超过 20KB）；"
+            diff += ("\n还没加入 git 的新文件里，下面这些没有附上内容（超过 10 个、单个超过 20KB，或材料已经太长）；"
                      "能运行命令的话自己读：\n" + "\n".join(f"- {n}" for n in skipped) + "\n")
-    if len(diff) > MAX_DIFF_CHARS:
-        diff = diff[:MAX_DIFF_CHARS] + f"\n\n（diff 太长，后面 {len(diff) - MAX_DIFF_CHARS} 个字符已截断；能运行命令的话自己看完整改动）"
     return diff
 
 
@@ -1771,13 +1841,23 @@ def build_review_prompt(root: Path, cfg: dict, base: str, evidence: str | None =
             parts.append(f"## 项目规则：{rule}\n\n" + read_limited(root / rule, MAX_RULE_CHARS))
     parts.append("## 审查格式\n\n" + strip_comments(kit_file("review-format.md").read_text()).strip())
     files = changed_files(root, base, worktree=not committed_only)
-    cards = [Path(f).stem for f in card_files(cfg, files) if (root / f).is_file()]
+    cards = [Path(f).stem for f in card_files(cfg, files)]
+    cards += [i for i in ids_in(pr_body, card_ids(root, cfg)) if i not in cards]
     if not cards:
         task_id, _ = current_task(root, cfg, base=base)
         cards = [task_id] if task_id else []
+    shown_cards = 0
     for task_id in cards:
-        parts.append(f"## 任务卡（{cfg['tasks_dir']}/{task_id}.md）\n\n" + card_path(root, cfg, task_id).read_text().strip())
-    if not cards:
+        rel = f"{tasks_prefix(cfg)}{task_id}.md"
+        if committed_only:
+            found = subprocess.run(["git", "-C", str(root), "show", f"HEAD:{rel}"], capture_output=True, text=True)
+            text = found.stdout if found.returncode == 0 else None
+        else:
+            text = (root / rel).read_text() if (root / rel).is_file() else None
+        if text is not None:
+            parts.append(f"## 任务卡（{rel}）\n\n" + text.strip())
+            shown_cards += 1
+    if not shown_cards:
         parts.append("## 任务卡\n\n没有找到任务卡。需求以 PR 描述为准；需求或完成标准缺失，本身就是一个 Important 问题。")
     if pr_body.strip():
         parts.append("## PR 描述\n\n" + pr_body.strip())
@@ -1793,7 +1873,7 @@ def run_command_engine(root: Path, engine: dict, prompt: str, timeout: int) -> t
         output, prompt_file = Path(tmp) / "review.md", Path(tmp) / "prompt.md"
         prompt_file.write_text(prompt)
         cmd = engine["run"].replace("{output}", shlex.quote(str(output))).replace("{prompt_file}", shlex.quote(str(prompt_file)))
-        env = {**os.environ, "AGENTKIT_PROMPT_FILE": str(prompt_file), "AGENTKIT_OUTPUT_FILE": str(output)}
+        env = {**os.environ, "AGENTKIT_REVIEW": "1", "AGENTKIT_PROMPT_FILE": str(prompt_file), "AGENTKIT_OUTPUT_FILE": str(output)}
         proc = subprocess.run(cmd, shell=True, cwd=root, input=prompt, capture_output=True, text=True,
                               timeout=timeout, env=env)
         text = output.read_text() if output.exists() and output.read_text().strip() else proc.stdout
@@ -2045,13 +2125,13 @@ def cmd_hook(args: argparse.Namespace) -> int:
         return 0
     if args.event == "pre-commit":
         return hook_pre_commit(root, cfg)
-    if args.event == "session-start":
-        return hook_session_start(root, cfg)
-    raw = sys.stdin.read()
+    raw = sys.stdin.read() if not sys.stdin.isatty() else ""
     try:
         payload = json.loads(raw) if raw.strip() else {}
     except json.JSONDecodeError:
         payload = {}
+    if args.event == "session-start":
+        return hook_session_start(root, cfg, payload)
     if args.event == "pre-edit":
         return hook_pre_edit(root, cfg, payload)
     return hook_stop(root, cfg, payload)

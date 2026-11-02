@@ -649,6 +649,99 @@ class TaskHookTest(unittest.TestCase):
         self.assertTrue((self.repo.root / ".git/hooks/pre-commit").exists())
 
 
+class RoundTwoFixesTest(unittest.TestCase):
+    """Findings from the second independent review of annotation#17."""
+
+    def test_names_with_spaces_or_chinese_are_kept_whole(self):
+        repo = TempRepo({"agentkit.toml": toml_config(paths={"protected": ["vendor/**"]}), "a.txt": "a\n"})
+        try:
+            repo.git("checkout", "-q", "-b", "feature")
+            repo.write({"vendor/中文 文件.txt": "x\n"})
+            repo.git("add", "-A")
+            repo.git("commit", "-qm", "add")
+            files = ak.changed_files(repo.root, "main", worktree=False)
+            self.assertEqual(files, ["vendor/中文 文件.txt"])
+            self.assertEqual(ak.risk_floor(ak.load_config(repo.root), files)["floor"], "high")
+        finally:
+            repo.close()
+
+    def test_relative_paths_are_normalized_before_the_protected_check(self):
+        repo = TempRepo({"agentkit.toml": toml_config(paths={"protected": ["vendor/**"]}), "src/a.py": "x\n"})
+        try:
+            env = {**env_without_hook_dir(), "CLAUDE_PROJECT_DIR": str(repo.root)}
+            sneaky = repo.run("hook", "pre-edit", stdin=json.dumps({"tool_input": {"file_path": "src/../vendor/x.py"}}), env=env)
+            self.assertEqual(sneaky.returncode, 2)
+            self.assertIn("vendor/x.py", sneaky.stderr)
+        finally:
+            repo.close()
+
+    def test_stop_only_holds_a_session_to_what_it_changed(self):
+        repo = TempRepo({"agentkit.toml": toml_config(checks={"always": ["python3 -c \"import sys; sys.exit(1)\""]}),
+                         "src/a.py": "x = 1\n"})
+        try:
+            env = {**env_without_hook_dir(), "CLAUDE_PROJECT_DIR": str(repo.root)}
+            repo.write({"src/a.py": "x = 2\n"})  # someone's uncommitted work, failing checks
+            repo.run("hook", "session-start", stdin=json.dumps({"session_id": "reviewer"}), env=env)
+            self.assertEqual(repo.run("hook", "stop", stdin=json.dumps({"session_id": "reviewer"}), env=env).returncode, 0)
+            repo.run("hook", "session-start", stdin=json.dumps({"session_id": "author"}), env=env)
+            repo.write({"src/a.py": "x = 3\n"})
+            self.assertEqual(repo.run("hook", "stop", stdin=json.dumps({"session_id": "author"}), env=env).returncode, 2)
+            self.assertEqual(repo.run("hook", "stop", stdin="{}", env={**env, "AGENTKIT_REVIEW": "1"}).returncode, 0)
+            self.assertEqual(repo.run("hook", "stop", stdin="{}", env=env).returncode, 2)  # unknown session: as before
+        finally:
+            repo.close()
+
+    def test_required_task_cards_block_edits_and_commits_without_a_card(self):
+        repo = TempRepo({"agentkit.toml": toml_config(tasks={"dir": "docs/tasks", "required": True}), "src/a.py": "x\n"})
+        try:
+            env = {**env_without_hook_dir(), "CLAUDE_PROJECT_DIR": str(repo.root)}
+            edit = {"tool_input": {"file_path": str(repo.root / "src/a.py"), "content": "y\n"}}
+            self.assertEqual(repo.run("hook", "pre-edit", stdin=json.dumps(edit), env=env).returncode, 2)
+            local = {"tool_input": {"file_path": str(repo.root / ".agentkit/review.local.md"), "content": "r\n"}}
+            self.assertEqual(repo.run("hook", "pre-edit", stdin=json.dumps(local), env=env).returncode, 0)
+            repo.write({"src/a.py": "y\n"})
+            repo.git("add", "src/a.py")
+            self.assertEqual(repo.run("hook", "pre-commit").returncode, 1)
+            repo.write({"agentkit.toml": toml_config(tasks={"dir": "docs/tasks", "required": False})})
+            self.assertEqual(repo.run("hook", "pre-commit").returncode, 0)
+        finally:
+            repo.close()
+
+    def test_a_branch_naming_the_requirement_finds_its_only_card(self):
+        repo = TempRepo({"agentkit.toml": "", "docs/tasks/WIP-7-2.md": CARD.replace("WIP-1", "WIP-7-2")})
+        try:
+            repo.git("checkout", "-q", "-b", "me/feat/WIP-7-search")
+            self.assertEqual(ak.current_task(repo.root, ak.load_config(repo.root))[0], "WIP-7-2")
+            repo.write({"docs/tasks/WIP-7-1.md": CARD})
+            repo.git("add", "-A")
+            repo.git("commit", "-qm", "second card")
+            self.assertIsNone(ak.current_task(repo.root, ak.load_config(repo.root), base="HEAD")[0])
+        finally:
+            repo.close()
+
+    def test_review_material_names_cut_files_and_reads_committed_cards(self):
+        repo = TempRepo({"agentkit.toml": "", "docs/tasks/WIP-1.md": CARD, "src/keep.py": "x\n"})
+        old_limit = ak.MAX_DIFF_CHARS
+        try:
+            repo.git("checkout", "-q", "-b", "feature")
+            repo.write({f"src/big{i}.py": "line\n" * 400 for i in range(3)})
+            repo.git("add", "-A")
+            repo.git("commit", "-qm", "big")
+            ak.MAX_DIFF_CHARS = 3000
+            diff = ak.review_diff(repo.root, "main", committed_only=True)
+            self.assertIn("没有附上", diff)
+            self.assertIn("- src/big2.py", diff)
+            repo.write({"docs/tasks/WIP-1.md": CARD.replace("下单的用户", "工作区里的改动")})
+            prompt = ak.build_review_prompt(repo.root, ak.load_config(repo.root), "main", pr_body="任务：WIP-1",
+                                            committed_only=True)
+            self.assertIn("任务卡（docs/tasks/WIP-1.md）", prompt)  # named in the PR, unchanged on the branch
+            self.assertIn("下单的用户", prompt)
+            self.assertNotIn("工作区里的改动", prompt)
+        finally:
+            ak.MAX_DIFF_CHARS = old_limit
+            repo.close()
+
+
 class PromptTest(unittest.TestCase):
     def setUp(self):
         self.repo = TempRepo({"agentkit.toml": "", "docs/tasks/WIP-1.md": CARD})
