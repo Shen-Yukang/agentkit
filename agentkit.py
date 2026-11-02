@@ -1701,8 +1701,15 @@ def build_review_prompt(root: Path, cfg: dict, base: str, evidence: str | None =
                   "不通过就改到通过。不要修改其他文件。")
     else:
         finish = "不要修改任何文件。把完整结果作为你的最终回复直接输出，前后不要加别的话。"
+    if committed_only or base == "HEAD":
+        scope, diff_cmd = f"`{base}...HEAD`（已提交的改动）", f"git diff {base}...HEAD"
+    else:
+        merge_base = git(root, "merge-base", base, "HEAD").strip()
+        scope = f"`{base}` 之后的全部改动，**包括还没提交的**（工作区里的修改和新文件）"
+        diff_cmd = f"git diff {merge_base[:12]}`（看工作区）和 `git status"
     template = split_frontmatter(kit_file("prompts", "reviewer.md").read_text())[1]
-    parts = [drop_owned_marker(template.replace("$BASE", base).replace("$OUTPUT", finish)).strip()]
+    filled = template.replace("$SCOPE", scope).replace("$DIFF_CMD", diff_cmd).replace("$OUTPUT", finish)
+    parts = [drop_owned_marker(filled).strip()]
     for rule in dict.fromkeys(cfg["rules_always"] + cfg["rules_review"]):
         if (root / rule).is_file():
             parts.append(f"## 项目规则：{rule}\n\n" + read_limited(root / rule, MAX_RULE_CHARS))
@@ -1838,16 +1845,19 @@ def merge_reviews(valid: list[tuple[str, str, dict]], advisory: list[tuple[str, 
 
     lines = [f"## AI 审查（{len(valid)} 位独立审查者：{'、'.join(names)}）", ""]
     if groups:
-        lines += ["| 位置 | 级别 | 提出者 | 问题 |", "|---|---|---|---|"]
+        # one row per spot; every reviewer's own words and severity, so nobody is credited with another's claim
+        lines += ["| 位置 | 级别 | 谁说了什么 |", "|---|---|---|"]
         for group in sorted(groups, key=lambda g: min(SEVERITY_RANK[i["severity"]] for i in g)):
             top = min(group, key=lambda i: SEVERITY_RANK[i["severity"]])
             where = f"`{top['file']}" + (f":{top['line']}`" if top.get("line") is not None else "`")
             level = SEVERITY_LABEL[top["severity"]]
             if top["severity"] == "important":
                 level += " · " + ("已确认" if any(i["severity"] == "important" and i["confirmed"] for i in group) else "待确认")
-            who = "、".join(dict.fromkeys(i["reviewer"] for i in group))
-            summary = top["summary"].replace("|", "\\|").replace("\n", " ")
-            lines.append(f"| {where} | {level} | {who} | {summary[:80]} |")
+            said = []
+            for i in sorted(group, key=lambda i: SEVERITY_RANK[i["severity"]]):
+                summary = i["summary"].replace("|", "\\|").replace("\n", " ")[:80]
+                said.append(f"**{i['reviewer']}**（{SEVERITY_LABEL[i['severity']]}）：{summary}")
+            lines.append(f"| {where} | {level} | {'<br>'.join(said)} |")
     else:
         lines.append("没有审查者发现需要改的问题。")
     lines += ["", f"**风险初判：{RISK_ZH[risk]}**（取各审查者里最高的）", "",

@@ -665,7 +665,9 @@ class ReviewEngineTest(unittest.TestCase):
         self.assertEqual(merged["reviewers"], ["claude", "deepseek"])
         self.assertEqual(len(merged["issues"]), 2)
         self.assertIn("2 位独立审查者", text)
-        self.assertIn("claude、deepseek", text)  # same spot, grouped
+        row = next(line for line in text.splitlines() if line.startswith("| `a.py"))
+        self.assertIn("**claude**（Important）", row)  # same spot, one row, each reviewer's own words
+        self.assertIn("**deepseek**（Nit）", row)
 
     def test_agree_needs_several_reviewers_to_block(self):
         a = review("low", [issue()])
@@ -702,6 +704,8 @@ class ReviewEngineTest(unittest.TestCase):
             self.assertEqual(merged["failed_reviewers"], ["bad"])
             prompt = repo.run("review", "--print-prompt", "--base", "main").stdout
             self.assertIn("x = 2", prompt)
+            self.assertIn("包括还没提交的", prompt)
+            self.assertIn("...HEAD`（已提交的改动）", repo.run("review", "--print-prompt", "--ci", "--base", "main").stdout)
             self.assertIn("审查格式", prompt)
             plan = repo.run("review", "--ci", "--plan").stdout
             self.assertIn("action=true", plan)
