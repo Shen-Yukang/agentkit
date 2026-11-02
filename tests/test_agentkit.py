@@ -380,12 +380,27 @@ class InitTest(unittest.TestCase):
         self.assertEqual(len(settings["hooks"]["SessionStart"]), 1)
         self.assertIn("Bash(python3 .agentkit/agentkit.py task confirm:*)", settings["permissions"]["deny"])
 
+    def test_a_repo_that_ships_its_own_hooks_gets_one_line_there(self):
+        self.repo.write({".githooks/pre-commit": "#!/bin/sh\nset -eu\nmake check\n"})
+        self.init()
+        hook = (self.repo.root / ".githooks/pre-commit").read_text()
+        self.assertTrue(hook.endswith(ak.GIT_HOOK_GUARDED + "\n"))
+        self.assertFalse((self.repo.root / ".git/hooks/pre-commit").exists())
+        self.init()
+        self.assertEqual((self.repo.root / ".githooks/pre-commit").read_text(), hook)
+        exec_hook = self.repo.root / "x-pre-commit"
+        exec_hook.write_text("#!/bin/sh\nexec lint-staged\n")
+        ak.add_to_hook(exec_hook)
+        self.assertEqual(exec_hook.read_text().splitlines()[-1], "exec lint-staged")
+
     def test_other_agents_get_a_pointer_and_a_repo_without_agents_md_gets_one(self):
         (self.repo.root / "AGENTS.md").unlink()
-        (self.repo.root / "agentkit.toml").write_text('[agents]\ninstruction_files = ["CLAUDE.md", "GEMINI.md"]\n')
+        (self.repo.root / "agentkit.toml").write_text('[agents]\ninstruction_files = ["CLAUDE.md", "GEMINI.md"]\n'
+                                                    '[tasks]\nnote = "最终记录写在 changes/"\n')
         self.init()
         root = self.repo.root
         self.assertIn("被纠正过的规则", (root / "AGENTS.md").read_text())
+        self.assertIn("7. **本仓库**：最终记录写在 changes/", (root / "AGENTS.md").read_text())
         self.assertIn("AGENTS.md", (root / "GEMINI.md").read_text())
         self.assertIn("@AGENTS.md", (root / "CLAUDE.md").read_text())
 

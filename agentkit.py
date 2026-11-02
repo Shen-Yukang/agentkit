@@ -118,6 +118,7 @@ def load_config(root: Path) -> dict:
         "trusted_authors": list(data.get("review", {}).get("trusted_authors", ["github-actions[bot]"])),
         "tasks_dir": str(data.get("tasks", {}).get("dir", "docs/tasks")).strip("/"),
         "tasks_required": bool(data.get("tasks", {}).get("required", False)),
+        "tasks_note": str(data.get("tasks", {}).get("note", "")).strip(),
         "block_before_confirm": bool(data.get("hooks", {}).get("block_edits_before_confirm", True)),
         "instruction_files": list(data.get("agents", {}).get("instruction_files", ["CLAUDE.md"])),
         "review_local": list(data.get("review", {}).get("local", ["claude"])),
@@ -783,6 +784,8 @@ def task_show(root: Path, cfg: dict, args: argparse.Namespace) -> int:
     if not args.brief:
         out = [f"任务卡 `{rel}`（{how}）：", "", text.rstrip(), "", "---"]
     out += ["状态（agentkit 读出来的）："] + status_lines(task_id, st) + ["", rule_reminder(st)]
+    if cfg["tasks_note"]:
+        out.append(f"本仓库：{cfg['tasks_note']}")
     print("\n".join(out))
     return 0
 
@@ -1107,19 +1110,50 @@ def hook_pre_commit(root: Path, cfg: dict) -> int:
 
 
 GIT_HOOK_LINE = "python3 .agentkit/agentkit.py hook pre-commit"
+GIT_HOOK_GUARDED = f"[ ! -f .agentkit/agentkit.py ] || {GIT_HOOK_LINE}  # agentkit：需求没确认前不提交代码"
+SHIPPED_HOOK_DIRS = (".githooks", ".husky")
+
+
+def add_to_hook(path: Path) -> bool:
+    """Add the kit's line to a hook the repository ships; before a final exec, which would never return."""
+    text = path.read_text()
+    if GIT_HOOK_LINE in text:
+        return False
+    lines = text.rstrip("\n").split("\n")
+    at = len(lines) - 1 if lines and lines[-1].lstrip().startswith("exec ") else len(lines)
+    lines.insert(at, GIT_HOOK_GUARDED)
+    path.write_text("\n".join(lines) + "\n")
+    return True
 
 
 def install_git_hook(root: Path) -> str:
-    """Install the pre-commit hook in this clone. Returns what happened, for the install report."""
+    """Hook the kit into git commits. Returns what happened, for the install report.
+
+    A repository that ships its own hooks (core.hooksPath, .githooks/, .husky/) gets one line in its pre-commit,
+    so everyone who enables the repository's hooks gets the check; .git/hooks is left alone so the repository's
+    own installer is not blocked. Otherwise the hook goes into this clone's .git/hooks.
+    """
     custom = subprocess.run(["git", "-C", str(root), "config", "core.hooksPath"], capture_output=True, text=True).stdout.strip()
+    shipped = None
     if custom:
-        return f"仓库用了自己的 git 钩子目录 {custom}：请在其中的 pre-commit 里加一行 `{GIT_HOOK_LINE}`"
+        candidate = (Path(custom) if os.path.isabs(custom) else root / custom).resolve() / "pre-commit"
+        if candidate.is_file() and candidate.is_relative_to(root.resolve()):
+            shipped = candidate
+        else:
+            return f"git 钩子目录是 {custom}：请在其中的 pre-commit 里加一行 `{GIT_HOOK_GUARDED}`"
+    else:
+        shipped = next((root / d / "pre-commit" for d in SHIPPED_HOOK_DIRS if (root / d / "pre-commit").is_file()), None)
+    if shipped:
+        rel = os.path.relpath(shipped, root)
+        if not add_to_hook(shipped):
+            return ""
+        return f"在仓库自带的 {rel} 里加了一行 agentkit 检查；按仓库自己的方式启用 git 钩子后生效"
     hooks = Path(git(root, "rev-parse", "--git-path", "hooks").strip())
     hook = (hooks if hooks.is_absolute() else root / hooks) / "pre-commit"
     if hook.exists():
         if GIT_HOOK_LINE in hook.read_text(errors="ignore"):
             return ""
-        return f"已有 {os.path.relpath(hook, root)}：请在里面加一行 `{GIT_HOOK_LINE}`"
+        return f"已有 {os.path.relpath(hook, root)}：请在里面加一行 `{GIT_HOOK_GUARDED}`"
     hook.parent.mkdir(parents=True, exist_ok=True)
     hook.write_text(f"#!/bin/sh\n# {OWNED}：需求没确认前不提交代码\nexec {GIT_HOOK_LINE}\n")
     hook.chmod(0o755)
@@ -1210,6 +1244,8 @@ def config_text(found: dict) -> str:
               'dir = "docs/tasks"',
               "# PR 改了代码却没有任务卡，或需求没人确认：true 判为不通过；false 只提醒",
               "required = true",
+              "# 本仓库对任务卡的补充说明（比如和已有任务记录的分工），会写进 AGENTS.md 和 task show",
+              '# note = ""',
               "",
               "[agents]",
               "# 所有 agent 都从 AGENTS.md 读流程。这里列出还要写入口的文件（某些 agent 只读自己的文件）：",
@@ -1266,8 +1302,12 @@ def agents_block(cfg: dict) -> str:
         f"5. **收工前交接**：更新任务卡的「交接」（做到、下一步、试过不行的），再运行 `{CLI} task handoff --agent <你是哪个 agent>`。",
         f"6. **仓库的事实**：检查命令、受保护路径、高风险路径，运行 `{CLI} context` 查看。",
     ]
+    extra = []
     if others:
-        lines.append("7. **项目规则**：还要遵守 " + "、".join(f"`{r}`" for r in others) + "。")
+        extra.append("**项目规则**：还要遵守 " + "、".join(f"`{r}`" for r in others) + "。")
+    if cfg["tasks_note"]:
+        extra.append(f"**本仓库**：{cfg['tasks_note']}")
+    lines += [f"{n}. {text}" for n, text in enumerate(extra, start=7)]
     lines += ["", f"没有仓库权限的聊天机器人：由人运行 `{CLI} prompt <步骤>`，把输出整段贴给它，再把回答整理进任务卡。",
               BLOCK_END]
     return "\n".join(lines)
