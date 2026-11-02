@@ -1,4 +1,4 @@
-# agentkit（v0.3）
+# agentkit（v0.3.1）
 
 一套通用的 kit，加上每个仓库一份配置 `agentkit.toml`。它把“人说清什么算做对 → 人确认 → AI 写 → 另一方验证 → 按风险找人”这条流程落成任务卡、命令和门禁，**不绑定哪一家 agent**：Claude Code、Codex、Kimi、Grok、DeepSeek，或者只能聊天的机器人，都走同一套。
 
@@ -107,10 +107,19 @@ key_env = "DEEPSEEK_API_KEY"
 ## 装到一个仓库
 
 ```bash
-python3 agentkit.py init /path/to/repo
+git clone https://github.com/Shen-Yukang/agentkit.git ~/tools/agentkit
+python3 ~/tools/agentkit/agentkit.py init /path/to/repo
 ```
 
-需要 Python 3.9 或以上（macOS 自带的 python3 就行），不依赖第三方包。升级就是再运行一次 `init`。
+需要 Python 3.9 或以上（macOS 自带的 python3 就行），不依赖第三方包。init 生成的 `agentkit.toml` 请人看一遍：检查命令、受保护和高风险路径、`[tasks] required`（强制还是只提醒）、`[review]` 的审查者。
+
+升级：更新 kit，再运行一次 `init`。它只覆盖 kit 自己的文件。
+
+```bash
+git -C ~/tools/agentkit pull && python3 ~/tools/agentkit/agentkit.py init /path/to/repo
+```
+
+`.agentkit/VERSION` 记录 kit 版本、来源提交和脚本的 sha256，可以核对仓库里装的是哪一版。
 
 | 文件 | 归谁 | 升级时 |
 |---|---|---|
@@ -122,7 +131,7 @@ python3 agentkit.py init /path/to/repo
 | `.agentkit/`：脚本、提示词、任务卡模板、审查格式、协作约定 | kit | 覆盖 |
 | `.claude/commands/` 下的 6 个命令 | kit | 覆盖（同名但不是 kit 生成的会跳过） |
 | `.github/workflows/agentkit.yml` | kit | 覆盖 |
-| `.git/hooks/pre-commit` | 每个克隆 | 没有才装；仓库用了自己的钩子目录时，提示加一行。其他人运行 `hook install-git` |
+| git 提交前检查 | 仓库或每个克隆 | 仓库自带钩子（`.githooks/`、`.husky/` 或 `core.hooksPath`）时，在它的 pre-commit 里加一行，按仓库自己的方式启用；否则装到这个克隆的 `.git/hooks/pre-commit`，其他人运行 `hook install-git` |
 
 从 0.2 升级：`agentkit.toml` 不会被改，所以没有 `[tasks]` 时任务卡检查只提醒、不拦 PR；init 会提示怎么打开。
 
@@ -153,6 +162,8 @@ Claude Code 里还有 `/restate`、`/repro`、`/verify`、`/selfcheck`、`/pr-de
 
 不需要换掉现有的 CI。不用 GitHub 的话，在你们的 CI 里依次运行 `task check`、`checks`、`review --ci`、`gate` 即可。
 
+免费的私有仓库不能把检查设为必须通过，CI 结果只起提醒作用，真正拦住的是本地钩子和人的审查。也可以不在 CI 里审查：本地运行 `review`（用本机已登录的 Claude Code、Codex，不花 API 额度），再用 `gate --pr N` 把结论发成 PR 评论、加 `risk:*` 标签。
+
 **PR 不能改自己的门禁**：CI 先把 `.agentkit/` 和 `agentkit.toml` 换成 base 分支上的版本，再运行检查和门禁。改配置的 PR 只有合入之后才对后面的 PR 生效，改动本身按高风险处理。
 
 ## 防得住什么，防不住什么
@@ -170,7 +181,8 @@ python3 -m unittest discover -s tests -v
 ## 已知限制
 
 - GitHub 上的 AI 审查还没在真实仓库里完整跑通过：试跑卡在 API 额度上。
-- `codex` 审查者的命令行参数（`--sandbox read-only`、`--output-last-message`）按文档写成，还没在真机上验证。
+- 审查者偶尔不按格式输出结果块（放在代码块里、分数用中文名），kit 会判为没跑成；在审查说明里写明格式可以避免，更宽松的解析在计划中。
+- `gate` 数轮次只认 `github-actions[bot]` 发的评论；本地多轮审查用个人账号发的评论不计入，轮次要手动给。
 - `api` 审查者一次请求完成，不能自己运行命令验证问题，所以它报的问题大多是“待确认”；能运行命令的审查者（本地 CLI、GitHub 上的 Claude）验证得更充分。
 - 从 fork 来的 PR 拿不到密钥，审查不会运行。
 - `npm ci` 这类安装步骤需要写在检查命令里；工作流本身只准备了 Python。
