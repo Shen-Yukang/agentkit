@@ -1,9 +1,13 @@
+import hashlib
 import importlib.util
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -853,6 +857,417 @@ class ReviewEngineTest(unittest.TestCase):
         except RuntimeError as e:
             error = str(e)
         self.assertIn("AGENTKIT_TEST_NO_KEY", error)
+
+
+# ---------------------------------------------------------------- languages
+
+CJK = re.compile(r"[\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff\uff00-\uffef]")
+GOLDEN = KIT / "tests" / "golden" / "default-zh.txt"
+
+CARD_EN = """# WIP-1 Tell people when an item is out of stock
+
+## Requirement
+
+- Who needs it: people placing orders
+- What it solves: an order for an out-of-stock item returns 500 today
+- Done when:
+  - it returns 409 and "out of stock"
+- Confirmed by:
+
+## Decisions for people
+
+- [x] 409 or 400 → 409 (product, in chat, 11-01)
+- [ ] With several items, fail the whole order or drop the missing ones? (suggestion: fail the whole order)
+
+## Steps
+
+1. [done] Check stock in the order API
+2. [doing] Show the message in the web app
+3. [todo] Several items
+
+## Handoff
+
+- Progress: the API change is merged
+- Next step: handle 409 on the checkout page
+- Tried and failed:
+
+## Log
+"""
+
+SCENARIO = {
+    "zh": {"title": "下单库存不足", "need": "下单时库存不足要提示", "card": CARD, "confirm": "- 确认：",
+           "progress": ("- 做到：接口已合入", "- 做到：前端提示也做完了"), "note": "最终记录写在 changes/",
+           "review": "## AI 审查\n\n正文\n", "summary": "库存检查漏了并发"},
+    "en": {"title": "Out-of-stock message", "need": "Tell people when an item is out of stock", "card": CARD_EN,
+           "confirm": "- Confirmed by:", "progress": ("- Progress: the API change is merged", "- Progress: the web app message is done too"),
+           "note": "Final notes go in changes/", "review": "## AI review\n\nBody\n", "summary": "the stock check misses concurrent orders"},
+}
+
+
+def clean_env(**extra):
+    """No Claude Code, CI or personal git settings: the same session prints the same thing anywhere."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "AGENTKIT_", "GITHUB_", "GIT_"))}
+    env.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}, **extra)
+    return env
+
+
+def in_terminal(cmd, cwd, env, answer):
+    """Run cmd with a terminal on stdin (task confirm insists on one) and type answer into it."""
+    import pty
+    master, slave = pty.openpty()
+    try:
+        proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        os.write(master, answer.encode())
+        stdout, stderr = proc.communicate(timeout=60)
+    finally:
+        os.close(slave)
+        os.close(master)
+    return proc.returncode, stdout, stderr
+
+
+def review_engine(text):
+    """A command reviewer (see [review.engines]) that ignores its prompt and answers text."""
+    return shlex.quote(sys.executable) + " -c " + shlex.quote(f"import sys; sys.stdin.read(); print({text!r})")
+
+
+def transcript(script, lang):
+    """One fixed session of agentkit in a fresh repository: every command, what it printed, and the files it wrote.
+
+    script is a kit checkout's agentkit.py. tests/golden/default-zh.txt is this session in Chinese as 0.3.1 ran it
+    (transcript(<git archive v0.3.1>/agentkit.py, "zh")); commit hashes, dates, timings and the version are masked.
+    """
+    data = SCENARIO[lang]
+    log = []
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d).resolve() / "repo"
+        root.mkdir()
+        env = clean_env()
+        hook_env = clean_env(CLAUDE_PROJECT_DIR=str(root))
+
+        def git(*args):
+            return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, check=True, env=env).stdout
+
+        def commit(*args):  # the kit's own git hook is under test, not in the way of setting up
+            git("commit", "-q", "--no-verify", *args)
+
+        def write(files):
+            for name, content in files.items():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text(content)
+
+        def record(shown, code, stdout, stderr):
+            log.append(f"$ agentkit {shown}")
+            log.append(f"[exit {code}]")
+            log.extend(stdout.rstrip("\n").splitlines())
+            log.extend("stderr| " + line for line in stderr.rstrip("\n").splitlines())
+            log.append("")
+
+        def run(*args, stdin="", kit=None, environ=None):
+            cmd = [sys.executable, str(kit or root / ".agentkit/agentkit.py"), *args]
+            proc = subprocess.run(cmd, cwd=root, input=stdin, capture_output=True, text=True, env=environ or env)
+            record(" ".join(args), proc.returncode, proc.stdout, proc.stderr)
+
+        def hook(event, payload):
+            run("hook", event, stdin=json.dumps(payload), environ=hook_env)
+
+        def edit(rel, **tool_input):
+            hook("pre-edit", {"tool_name": "Edit", "tool_input": {"file_path": str(root / rel), **tool_input}})
+
+        def confirm(answer):
+            cmd = [sys.executable, str(root / ".agentkit/agentkit.py"), "task", "confirm", "WIP-1"]
+            record(f"task confirm WIP-1  # a person types {answer!r}", *in_terminal(cmd, root, env, answer))
+
+        def show(*names):
+            for name in names:
+                log.extend([f"=== {name}", (root / name).read_text().rstrip("\n"), ""])
+
+        def owned():
+            for top in (".agentkit", ".claude/commands", ".github/workflows"):
+                for path in sorted((root / top).rglob("*")):
+                    if path.is_file() and path.name not in ("agentkit.py", "VERSION") and not path.name.endswith(".local.md"):
+                        log.append(f"{path.relative_to(root)}  sha256:{hashlib.sha256(path.read_bytes()).hexdigest()[:16]}")
+            log.append("")
+
+        git("init", "-q", "-b", "main")
+        git("config", "user.email", "t@example.com")
+        git("config", "user.name", "t")
+        write({"Makefile": ".PHONY: check\ncheck:\n\ttrue\nunit-test:\n\ttrue\n", "AGENTS.md": "rules\n",
+               "REVIEW.md": "review rules\n", "CONTRIBUTING.md": "contributing\n", "vendor/x.txt": "v\n",
+               "src/a.py": "x = 1\n", ".claude/commands/restate.md": "my own command\n"})
+        git("add", "-A")
+        commit("-m", "start")
+
+        run("init", str(root), *(["--language", "en"] if lang == "en" else []), kit=script)
+        show("agentkit.toml", "AGENTS.md", "CLAUDE.md", ".claude/settings.json", ".gitignore", ".git/hooks/pre-commit")
+        owned()
+        kit_table = '[kit]\nlanguage = "en"\n' if lang == "en" else ""
+        always = "import os, sys; bad = os.path.exists('FAIL'); print('FAIL is here' if bad else 'ok'); sys.exit(1 if bad else 0)"
+        result = {"scores": {"requirement": 4, "evidence": 3, "risk": 3, "readability": 4}, "risk_level": "medium",
+                  "issues": [{"file": "src/a.py", "line": 1, "severity": "important", "confirmed": True, "summary": data["summary"]}]}
+        good = data["review"] + "\n<!-- ai-review-result\n" + json.dumps(result, ensure_ascii=False) + "\n-->"
+        write({"agentkit.toml": kit_table + "\n".join([
+            "[rules]", 'always = ["AGENTS.md", "CONTRIBUTING.md"]', 'review = ["REVIEW.md"]',
+            "[checks]", f"always = {json.dumps(['python3 -c ' + json.dumps(always)])}",
+            "[[checks.by_path]]", 'paths = ["src/**"]', 'run = ["python3 -c \\"import sys; print(\'boom\'); sys.exit(3)\\""]',
+            "[paths]", 'protected = ["vendor/**"]',
+            "[tasks]", 'dir = "docs/tasks"', "required = true", f"note = {json.dumps(data['note'], ensure_ascii=False)}",
+            "[agents]", 'instruction_files = ["CLAUDE.md", "GEMINI.md"]',
+            "[review]", 'local = ["good", "good", "bad"]', "agree = 2",
+            "[review.engines.good]", 'type = "command"', f"run = {json.dumps(review_engine(good))}",
+            "[review.engines.bad]", 'type = "command"', f"run = {json.dumps(review_engine('---'))}", ""])})
+        run("init", str(root), kit=script)  # upgrade with the project's own config
+        show("AGENTS.md", "CLAUDE.md", "GEMINI.md")
+        git("add", "-A")
+        commit("-m", "kit")
+
+        run("context")
+        run("context", "--for", "review")
+        run("task", "list")
+        run("task", "show")
+        hook("session-start", {"session_id": "s1"})
+        edit("src/a.py", old_string="x = 1", new_string="x = 2")
+        edit("vendor/x.txt", old_string="v", new_string="w")
+        run("task", "new", "bad id")
+        run("task", "new", "WIP-1", data["title"])
+        run("task", "new", "WIP-1")
+        run("task", "show")
+        run("task", "show", "--brief")
+        run("prompt")
+        run("prompt", "restate", data["need"])
+        run("prompt", "nope")
+        edit("src/a.py", old_string="x = 1", new_string="x = 2")
+        edit("docs/tasks/WIP-1.md", old_string=data["confirm"], new_string=data["confirm"] + " me")
+        run("task", "confirm")
+        run("task", "handoff")
+        write({"docs/tasks/WIP-1.md": data["card"]})
+        run("task", "show", "--brief")
+        confirm("n\n")
+        git("checkout", "-q", "-b", "feature/WIP-1-stock")
+        git("add", "-A")
+        commit("-m", "card")
+        write({"src/a.py": "x = 2\n"})
+        git("add", "src/a.py")
+        run("hook", "pre-commit")
+        run("task", "check", "--base", "main", "--committed-only")
+        confirm("y\n")
+        show("docs/tasks/WIP-1.md")
+        run("task", "show", "--brief")
+        git("add", "docs")
+        run("hook", "pre-commit")
+        commit("-m", "sign off and code")
+        write({"src/a.py": "x = 3\n", ".github/workflows/ci.yml": "name: ci\n"})
+        edit("src/a.py", old_string="x = 2", new_string="x = 3")
+        run("checks", "--base", "main")
+        write({"FAIL": "x\n"})
+        hook("stop", {})
+        (root / "FAIL").unlink()
+        write({"docs/tasks/WIP-1.md": (root / "docs/tasks/WIP-1.md").read_text().replace(*data["progress"])})
+        hook("stop", {})
+        run("task", "handoff", "--agent", "Kimi")
+        show("docs/tasks/WIP-1.md")
+        hook("session-start", {"session_id": "s2"})
+        git("add", "-A")
+        commit("-m", "code")
+        run("task", "list")
+        run("task", "check", "--base", "main", "--committed-only", "--branch", "feature/WIP-1-stock")
+        run("review", "--base", "main")
+        show(".agentkit/review.local.md")
+        run("review", "--print-prompt", "--base", "main")
+        run("review", "--ci", "--plan")
+        unconfirmed = json.loads(json.dumps(result))
+        unconfirmed["issues"][0]["confirmed"] = False
+        write({"review-fail.md": good + "\n",
+               "review-pass.md": data["review"] + "\n<!-- ai-review-result\n" + json.dumps(unconfirmed) + "\n-->\n",
+               "bad.md": "## AI review\n", "out.json": json.dumps([
+                   {"error": "billing_error", "is_api_error_message": True,
+                    "message": {"content": [{"type": "text", "text": "Credit balance is too low"}]}},
+                   {"error": "invalid_request_error", "is_api_error_message": True,
+                    "message": {"content": [{"type": "text", "text": "This API key is not scoped to a workspace"}]}}]),
+               "empty.json": "[]"})
+        run("gate", "--review", "review-fail.md", "--base", "main", "--head", "abcdef1234567", "--dry-run")
+        run("gate", "--review", "review-pass.md", "--base", "main", "--head", "abcdef1234567", "--dry-run")
+        run("validate", "review-pass.md")
+        run("validate", "bad.md")
+        run("explain-failure", "--file", "out.json", "--dry-run")
+        run("explain-failure", "--file", "empty.json", "--dry-run")
+        run("risk", "--base", "main")
+        run("task", "use", "--clear")
+        run("task", "show")
+        run("task", "use", "nope")
+        run("task", "use", "WIP-1")
+        run("hook", "install-git")
+        write({".github/workflows/agentkit.yml": "name: changed\n"})
+        commit("-am", "change the review workflow")
+        run("gate", "--review", "nope.md", "--pr", "1", "--base", "main", "--dry-run")
+
+        commits = git("rev-list", "--all").split()
+    text = "\n".join(log) + "\n"
+    for n, sha in enumerate(reversed(commits)):
+        text = re.sub(rf"\b{sha[:7]}[0-9a-f]*\b", f"<commit {n}>", text)
+    text = re.sub(r"(?m)^index [0-9a-f]{7,}\.\.[0-9a-f]{7,}", "index <blobs>", text)  # blobs of files that hold a time
+    text = text.replace(str(root), "<repo>")
+    text = re.sub(r"\b20\d\d-\d\d-\d\d \d\d:\d\d\b", "<time>", text)
+    text = text.replace(time.strftime("%Y-%m-%d"), "<today>")
+    text = re.sub(r"\| [0-9.]+s \|", "| <seconds> |", text)
+    return re.sub(r"agentkit \d+\.\d+\.\d+", "agentkit <version>", text)
+
+
+class DefaultLanguageTest(unittest.TestCase):
+    def test_without_a_language_every_output_is_what_0_3_1_gave(self):
+        self.maxDiff = None
+        self.assertEqual(transcript(SCRIPT, "zh"), GOLDEN.read_text(encoding="utf-8"))
+
+    def test_the_requirement_fingerprint_is_unchanged(self):
+        # computed by 0.3.1 for CARD: cards signed before the upgrade stay signed
+        self.assertEqual(ak.requirement_fingerprint(ak.card_sections(CARD)["需求"]), "d4e11033")
+        old = ak.set_confirmation(CARD, "张三，2026-11-01（需求指纹 d4e11033）")
+        self.assertEqual(ak.card_status(old)["confirmed"], "yes")
+
+
+class EnglishTest(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(ak.set_language, ak.UI_LANG)
+
+    def test_the_language_comes_from_agentkit_toml(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            self.assertEqual(ak.load_config(root)["language"], "zh")
+            for value, lang in (("en", "en"), ("EN-us", "en"), ("zh_CN", "zh")):
+                (root / "agentkit.toml").write_text(f'[kit]\nlanguage = "{value}"\n')
+                self.assertEqual(ak.load_config(root)["language"], lang)
+            (root / "agentkit.toml").write_text('[kit]\nlanguage = "fr"\n')
+            with self.assertRaises(ValueError):
+                ak.load_config(root)
+            (root / "agentkit.toml").write_text('[kit]\nlanguage = "en"\n[tasks\n')
+            self.assertEqual(ak.repo_language(root), "en")  # a broken config still gets its errors in English
+
+    def test_english_cards_are_read_and_signed(self):
+        ak.set_language("en")
+        st = ak.card_status(CARD_EN)
+        self.assertEqual((st["title"], st["lang"], st["missing"], st["confirmed"]),
+                         ("WIP-1 Tell people when an item is out of stock", "en", [], "no"))
+        self.assertEqual((len(st["open"]), st["decided"]), (1, 1))
+        self.assertEqual([state for state, _ in st["steps"]], ["done", "doing", "todo"])
+        self.assertEqual(st["handoff"]["下一步"], "handle 409 on the checkout page")
+        self.assertEqual(ak.card_status(CARD_EN.replace("- Done when:", "- done WHEN:"))["missing"], [])
+        self.assertEqual(ak.card_status(CARD_EN.replace("- Who needs it: people placing orders", "- Who needs it:"))["missing"],
+                         ["Who needs it"])
+        fp = ak.requirement_fingerprint(ak.section_of(ak.card_sections(CARD_EN), "需求"))
+        signed_en = ak.set_confirmation(CARD_EN, f"Alice, 2026-11-01 (requirement fingerprint {fp})")
+        self.assertIn(f"- Confirmed by: Alice, 2026-11-01 (requirement fingerprint {fp})\n", signed_en)
+        st = ak.card_status(signed_en)
+        self.assertEqual((st["confirmed"], st["confirmed_by"]), ("yes", "Alice, 2026-11-01"))
+        self.assertEqual(ak.card_status(signed_en.replace("returns 409", "returns 400"))["confirmed"], "stale")
+        self.assertEqual(ak.card_status(signed_en.replace("is merged", "is live"))["confirmed"], "yes")
+        logged = ak.append_to_section(signed_en, "记录", "- a line")
+        self.assertTrue(logged.endswith("## Log\n\n- a line\n"))
+        self.assertIn("## Log\n\n- a line", ak.append_to_section(CARD_EN.replace("## Log\n", ""), "记录", "- a line"))
+
+    def test_chinese_cards_are_read_the_same_in_an_english_repository(self):
+        ak.set_language("en")
+        st = ak.card_status(signed())
+        self.assertEqual((st["lang"], st["confirmed"], st["confirmed_by"]), ("zh", "yes", "张三，2026-11-01"))
+        self.assertEqual(ak.card_status(CARD.replace("- 满足谁：下单的用户", "- 满足谁："))["missing"], ["满足谁"])
+        self.assertIn("- 确认：", ak.set_confirmation(CARD, "x"))  # written in the card's own language
+        lines = "\n".join(ak.status_lines("WIP-1", ak.card_status(CARD)))
+        self.assertIn("- Sign-off: **not yet**", lines)
+        ak.set_language("zh")
+        self.assertEqual(ak.card_status(CARD_EN)["handoff"]["做到"], "the API change is merged")
+
+    def test_messages_and_toml_errors_follow_the_language(self):
+        ak.set_language("en")
+        self.assertIn("is out of credit", ak.hint_for("unknown", "Credit balance is too low"))
+        self.assertEqual(ak.parse_result("## AI review\n")[1], ["no ai-review-result block found"])
+        with self.assertRaisesRegex(ValueError, "agentkit.toml line 1: expected ] here"):
+            ak.parse_toml("[a\nb = 1\n")
+
+    def test_init_in_english_writes_english_everywhere(self):
+        repo = TempRepo({"AGENTS.md": "rules\n", "src/a.py": "x\n"})
+        try:
+            root = repo.root
+            env = env_without_hook_dir()
+            init = subprocess.run([sys.executable, str(SCRIPT), "init", str(root), "--language", "en"],
+                                  capture_output=True, text=True, env=env)
+            self.assertEqual(init.returncode, 0, init.stderr)
+            self.assertIn("installed in", init.stdout)
+            self.assertFalse(CJK.search(init.stdout))
+            self.assertEqual(ak.load_config(root)["language"], "en")
+            self.assertIn('[kit]\n# Language of everything agentkit writes and says: "en" (English) or "zh" (Chinese, the default)\n'
+                          'language = "en"\n', (root / "agentkit.toml").read_text())
+            en = KIT / "templates" / "en"
+            pairs = [(en / name, root / ".agentkit" / name) for name in ("task-card.md", "team-workflow.md", "review-format.md")]
+            pairs += [(src, root / ".agentkit/prompts" / src.name) for src in (en / "prompts").glob("*.md")]
+            pairs += [(src, root / ".claude/commands" / src.name) for src in (en / "prompts").glob("*.md")
+                      if src.stem not in ("reviewer", "start")]
+            pairs += [(en / "workflow.yml", root / ".github/workflows/agentkit.yml")]
+            self.assertEqual(len(pairs), 3 + 8 + 6 + 1)
+            for src, dest in pairs:
+                self.assertEqual(dest.read_text(), src.read_text(), dest)
+            for path in [src for src, _ in pairs] + [root / n for n in ("agentkit.toml", "AGENTS.md", "CLAUDE.md", ".git/hooks/pre-commit")]:
+                self.assertEqual([line for line in path.read_text().splitlines() if CJK.search(line)], [], path)
+            self.assertIn("## Working with people (agentkit)", (root / "AGENTS.md").read_text())
+            self.assertTrue((root / "AGENTS.md").read_text().startswith("rules\n"))
+
+            # switching back is the project's call, made in agentkit.toml; init alone does not do it
+            before = (root / "AGENTS.md").read_text()
+            refused = subprocess.run([sys.executable, str(SCRIPT), "init", str(root), "--language", "zh"],
+                                     capture_output=True, text=True, env=env)
+            self.assertEqual(refused.returncode, 1)
+            self.assertIn('[kit] language = "zh"', refused.stderr)
+            self.assertEqual((root / "AGENTS.md").read_text(), before)
+            config = (root / "agentkit.toml").read_text().replace('language = "en"', 'language = "zh"')
+            (root / "agentkit.toml").write_text(config)
+            switched = subprocess.run([sys.executable, str(SCRIPT), "init", str(root)], capture_output=True, text=True, env=env)
+            self.assertEqual(switched.returncode, 0, switched.stderr)
+            self.assertIn("已安装到", switched.stdout)
+            self.assertEqual((root / ".agentkit/task-card.md").read_text(), (KIT / "templates/task-card.md").read_text())
+            agents = (root / "AGENTS.md").read_text()
+            self.assertEqual(agents.count(ak.BLOCK_START), 1)
+            self.assertIn("## 和人协作的流程（agentkit）", agents)
+            self.assertTrue(agents.startswith("rules\n"))
+        finally:
+            repo.close()
+
+    def test_an_english_session_says_nothing_in_chinese(self):
+        text = transcript(SCRIPT, "en")
+        self.assertEqual([line for line in text.splitlines() if CJK.search(line)], [])
+        for expected in ("Created task card docs/tasks/WIP-1.md",
+                         "- Sign-off: **not yet**",
+                         "agentkit: nobody has confirmed the requirement of the current task WIP-1 yet",
+                         "- Confirmed by: t, <today> (requirement fingerprint ",
+                         "- <time> · t · Kimi · feature/WIP-1-stock@<commit",
+                         "### Automatic checks (agentkit checks)",
+                         "**agentkit verdict** (round 1, head `abcdef1`): risk **high**",
+                         "8. **This repository**: Final notes go in changes/",
+                         "This repository's workflow is in `AGENTS.md`."):
+            self.assertIn(expected, text)
+        self.assertNotIn("stale", text)
+
+    def test_a_chinese_card_works_in_an_english_repository(self):
+        repo = TempRepo({"agentkit.toml": '[kit]\nlanguage = "en"\n' + toml_config(tasks={"required": True}),
+                         "shop/orders.py": "x = 1\n", "docs/tasks/WIP-1.md": CARD})
+        try:
+            env = clean_env()
+            repo.run("task", "use", "WIP-1", env=env)
+            shown = repo.run("task", "show", "--brief", env=env).stdout
+            self.assertIn("- Requirement: all three answered", shown)
+            self.assertIn("- Next step: 结账页处理 409", shown)
+            code, out, err = in_terminal([sys.executable, str(SCRIPT), "task", "confirm"], repo.root, env, "y\n")
+            self.assertEqual(code, 0, out + err)
+            card = (repo.root / "docs/tasks/WIP-1.md").read_text()
+            self.assertIn("- 确认：t，", card)
+            self.assertIn("（需求指纹 d4e11033）", card)
+            self.assertIn("Confirmed. Remember to commit", out)
+            repo.git("checkout", "-q", "-b", "feature")
+            repo.write({"shop/orders.py": "x = 2\n"})
+            repo.git("add", "shop", "docs")
+            self.assertEqual(repo.run("hook", "pre-commit", env=env).returncode, 0)
+            repo.git("commit", "-qm", "code")
+            check = repo.run("task", "check", "--base", "main", "--committed-only", env=env)
+            self.assertEqual(check.returncode, 0, check.stdout)
+            self.assertIn("1 decision(s) still open", check.stdout)
+        finally:
+            repo.close()
 
 
 if __name__ == "__main__":
