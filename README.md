@@ -1,4 +1,6 @@
-# agentkit（v0.3.1）
+# agentkit（v0.4.0）
+
+[English](README.en.md)
 
 一套通用的 kit，加上每个仓库一份配置 `agentkit.toml`。它把“人说清什么算做对 → 人确认 → AI 写 → 另一方验证 → 按风险找人”这条流程落成任务卡、命令和门禁，**不绑定哪一家 agent**：Claude Code、Codex、Kimi、Grok、DeepSeek，或者只能聊天的机器人，都走同一套。
 
@@ -22,6 +24,7 @@
 - **任务卡**：放在哪、PR 上是否强制（`[tasks]`）。
 - **谁来审查**：本地和 CI 各用哪些审查者、几位、几位都提出才算数（`[review]`）。审查者可以是本地的 CLI、任何兼容的 API、GitHub 上的 Claude，或第三方审查机器人。
 - **在哪跑**：本地、GitHub Actions、别的 CI 都行，命令一样。
+- **用什么语言**：中文（默认）或英文（`[kit] language`），见下面的「语言」一节。
 
 ## 不同的 agent 怎么守流程
 
@@ -128,12 +131,29 @@ git -C ~/tools/agentkit pull && python3 ~/tools/agentkit/agentkit.py init /path/
 | `CLAUDE.md` 和 `[agents]` 里列出的文件 | 项目 | 只补引入行或一段指向 AGENTS.md 的说明 |
 | `.claude/settings.json` | 项目 | 只补 kit 的钩子和权限限制 |
 | `docs/tasks/*.md`（任务卡） | 项目 | 不动 |
-| `.agentkit/`：脚本、提示词、任务卡模板、审查格式、协作约定 | kit | 覆盖 |
+| `.agentkit/`：脚本、提示词、任务卡模板、审查格式、协作约定（按 `[kit] language` 的语言） | kit | 覆盖 |
 | `.claude/commands/` 下的 6 个命令 | kit | 覆盖（同名但不是 kit 生成的会跳过） |
 | `.github/workflows/agentkit.yml` | kit | 覆盖 |
 | git 提交前检查 | 仓库或每个克隆 | 仓库自带钩子（`.githooks/`、`.husky/` 或 `core.hooksPath`）时，在它的 pre-commit 里加一行，按仓库自己的方式启用；否则装到这个克隆的 `.git/hooks/pre-commit`，其他人运行 `hook install-git` |
 
 从 0.2 升级：`agentkit.toml` 不会被改，所以没有 `[tasks]` 时任务卡检查只提醒、不拦 PR；init 会提示怎么打开。
+
+从 0.3 升级到 0.4：没写 `[kit] language` 的仓库仍然是中文，所有输出和生成的文件都和 0.3.1 一样（有测试逐字对照），已经确认过的任务卡仍然有效。
+
+## 语言
+
+kit 说的话和写进仓库的东西（命令的提示和报错、钩子消息、PR 上的审查评论和门禁结论、`init` 生成的 `agentkit.toml`、AGENTS.md 里的那一节、提示词、任务卡模板、协作约定、审查格式、工作流）有中文和英文两套，由每个仓库在 `agentkit.toml` 里选：
+
+```toml
+[kit]
+language = "en"   # 或 "zh"；不写就是中文
+```
+
+- **新仓库用英文**：`python3 ~/tools/agentkit/agentkit.py init /path/to/repo --language en`。生成的 `agentkit.toml` 里会带上 `[kit] language = "en"`。`--language` 只在新建 `agentkit.toml` 时起作用。
+- **已经装好的仓库换语言**：改 `agentkit.toml` 里的 `[kit] language`，再运行一次 `init`。kit 自己的文件（`.agentkit/` 下的模板和提示词、`.claude/commands/`、工作流）和 AGENTS.md 里 kit 的那一节会换成新语言；项目自己的内容不动。`agentkit.toml` 归项目所有，`init` 不会替你改：语言和 `--language` 不一致时，`init` 什么都不做，并告诉你要改哪一行。
+- **任务卡两种语言都认**：标题和字段（`需求` / `Requirement`、`满足谁` / `Who needs it`、`解决什么` / `What it solves`、`怎么算做完` / `Done when`、`确认` / `Confirmed by`、`要人拍板的事` / `Decisions for people`、`拆分` / `Steps`、`交接` / `Handoff`、`做到` / `Progress`、`下一步` / `Next step`、`试过不行的` / `Tried and failed`、`记录` / `Log`）不管仓库选了哪种语言都能解析，英文名不分大小写。换了语言之后，旧的中文任务卡照样能读、能确认、能交接；需求指纹的算法没变，已确认的任务卡确认仍然有效。
+- **写进任务卡时跟着任务卡的语言**：`task confirm` 写的确认行、`task handoff` 写的记录行，用的是那张任务卡自己的语言（中文卡写 `确认：张三，2026-11-01（需求指纹 …）`，英文卡写 `Confirmed by: Alice, 2026-11-01 (requirement fingerprint …)`）；新建的任务卡用仓库当前语言的模板。
+- **审查结果的 JSON 不分语言**：`ai-review-result` 里的键和取值（`scores` 下的 `requirement`、`evidence`、`risk`、`readability`，`risk_level` 的 `low` / `medium` / `high`，`issues` 里 `severity` 的 `important` / `nit` / `pre-existing` 等）是机器契约，两种语言一样。
 
 ## 命令
 
@@ -177,6 +197,8 @@ Claude Code 里还有 `/restate`、`/repro`、`/verify`、`/selfcheck`、`/pr-de
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+`tests/golden/default-zh.txt` 是 0.3.1 跑同一套命令（`tests/test_agentkit.py` 里的 `transcript()`）的输出：测试逐字对照它，确认默认中文的输出和生成的文件没变。英文跑同一套命令时，输出和生成的文件里不能出现中文。
 
 ## 已知限制
 

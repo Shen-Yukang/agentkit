@@ -1,0 +1,1136 @@
+$ agentkit init <repo>
+[exit 0]
+agentkit <version> 已安装到 <repo>
+  新建：agentkit.toml
+  新建：.agentkit/review-format.md
+  新建：.agentkit/team-workflow.md
+  新建：.agentkit/task-card.md
+  新建：.agentkit/prompts/handoff.md
+  新建：.claude/commands/handoff.md
+  新建：.agentkit/prompts/pr-desc.md
+  新建：.claude/commands/pr-desc.md
+  新建：.agentkit/prompts/repro.md
+  新建：.claude/commands/repro.md
+  新建：.agentkit/prompts/restate.md
+  新建：.agentkit/prompts/reviewer.md
+  新建：.agentkit/prompts/selfcheck.md
+  新建：.claude/commands/selfcheck.md
+  新建：.agentkit/prompts/start.md
+  新建：.agentkit/prompts/verify.md
+  新建：.claude/commands/verify.md
+  新建：.github/workflows/agentkit.yml
+  更新：.claude/settings.json（加入钩子和权限限制）
+  更新：AGENTS.md（写入「和人协作的流程」一节，其余内容不动）
+  更新：CLAUDE.md（引入 AGENTS.md）
+  跳过：.claude/commands/restate.md（不是 agentkit 生成的文件，没有覆盖）
+  git 钩子：已安装 git pre-commit 钩子（只对这个克隆生效；其他人运行 `python3 .agentkit/agentkit.py hook install-git`）
+
+下一步：检查 agentkit.toml；新任务运行 `python3 .agentkit/agentkit.py task new <任务号> <标题>`；在 GitHub 添加审查要用的密钥，并把 agentkit / task、agentkit / checks、agentkit / review 设为必须通过的检查。
+
+=== agentkit.toml
+# agentkit.toml：只写这个仓库的事实。流程和规则在 kit 里统一维护，升级 kit 不会改动这个文件。
+version = 1
+
+[rules]
+# 写代码时每次都读（会引入 CLAUDE.md）
+always = ["AGENTS.md"]
+# 审查时额外读
+review = ["CONTRIBUTING.md", "REVIEW.md"]
+
+[checks]
+# 每次都跑；也是 Claude 结束一轮前自动跑的检查
+always = ["make check"]
+timeout_seconds = 900
+
+# 按改动路径加跑的检查。
+# 发现的候选：make unit-test
+# [[checks.by_path]]
+# paths = ["src/**"]
+# run = ["make test"]
+
+[paths]
+# 受保护：AI 改不了（钩子拦截），PR 改到就按高风险处理
+# 发现的候选：vendor/**
+protected = []
+# 高风险：改到就至少是高风险。kit 默认已包含 .github/workflows/**、agentkit.toml、.agentkit/**、.claude/settings.json
+high_risk = []
+
+[risk]
+# 各风险等级建议几个人审
+reviewers = { low = 0, medium = 1, high = 2 }
+
+[hooks]
+# Claude Code 结束一轮前自动跑 checks.always，没通过就让它接着修
+check_on_stop = true
+# 当前任务的需求还没人确认时，拦住 Claude Code 改代码（git 提交前的钩子对所有 agent 都拦）
+block_edits_before_confirm = true
+
+[tasks]
+# 任务卡放在哪：每个任务一个文件，记着需求、人的确认和拍板、拆分和交接；所有 agent 和人共用
+dir = "docs/tasks"
+# PR 改了代码却没有任务卡，或需求没人确认：true 判为不通过；false 只提醒
+required = true
+# 本仓库对任务卡的补充说明（比如和已有任务记录的分工），会写进 AGENTS.md 和 task show
+# note = ""
+
+[agents]
+# 所有 agent 都从 AGENTS.md 读流程。这里列出还要写入口的文件（某些 agent 只读自己的文件）：
+# CLAUDE.md 用 @ 引入 AGENTS.md；其他文件写一段指向 AGENTS.md 的说明。比如再加 "GEMINI.md"
+instruction_files = ["CLAUDE.md"]
+
+[review]
+# 本地 `agentkit review` 和 CI 各用哪些审查者。每位都是新开的独立会话；同一个写两次就开两个
+local = ["claude"]
+ci = ["claude-action"]
+# 同一处 Important 要几位审查者都提出才阻断合入（1 = 任何一位提出并确认就阻断）
+agree = 1
+
+# 内置审查者：claude（本地 claude -p）、codex（本地 codex exec）、claude-action（GitHub 上的 Claude）。
+# 兼容 OpenAI 接口的模型都能用 type = "api"：DeepSeek、Kimi、Grok、OpenRouter、本地 vLLM / Ollama 等。
+# [review.engines.deepseek]
+# type = "api"
+# format = "openai"                 # openai 或 anthropic
+# base_url = "https://api.deepseek.com"
+# model = "填模型名"
+# key_env = "DEEPSEEK_API_KEY"      # 从这个环境变量读 key；CI 里用同名的仓库密钥
+#
+# [review.engines.my-cli]
+# type = "command"                  # 任何能从标准输入读提示词、把结果输出到标准输出的命令
+# run = "填命令"                     # 可以用 {output}（结果文件）和 {prompt_file}（提示词文件）
+#
+# [review.engines.coderabbit]
+# type = "github-comments"          # 第三方审查机器人：意见附在评论里，仅供参考，不进门禁
+# author = "coderabbitai[bot]"
+
+=== AGENTS.md
+rules
+
+<!-- agentkit:start 由 agentkit 生成：这一段升级时会被替换，文件其余内容归项目 -->
+## 和人协作的流程（agentkit）
+
+不管你是哪个 agent，都按下面做。完整约定见 `.agentkit/team-workflow.md`，开工前读一遍。
+
+1. **开工先读任务卡**：运行 `python3 .agentkit/agentkit.py task show`。任务卡记着需求、人拍板过的事、做到哪一步、试过什么不行。
+2. **需求没确认，先复述**：没有任务卡就运行 `python3 .agentkit/agentkit.py task new <任务号> <标题>`；按 `python3 .agentkit/agentkit.py prompt restate` 给出的步骤把复述写进任务卡，然后停下，请人确认。**「确认」只能由人运行 `python3 .agentkit/agentkit.py task confirm` 填写，不要自己填，也不要替人运行。**需求确认前，除了任务卡不改别的文件。
+3. **拿不准就问**：会影响做法的选择写进任务卡「要人拍板的事」，附上你的建议；人在对话里定了，就把决定、谁定的、日期记进去。
+4. **一次一步**：一次只做「拆分」里的一块，做完运行 `python3 .agentkit/agentkit.py checks` 拿证据，更新这一块的状态。
+5. **收工前交接**：更新任务卡的「交接」（做到、下一步、试过不行的），再运行 `python3 .agentkit/agentkit.py task handoff --agent <你是哪个 agent>`。
+6. **仓库的事实**：检查命令、受保护路径、高风险路径，运行 `python3 .agentkit/agentkit.py context` 查看。
+
+没有仓库权限的聊天机器人：由人运行 `python3 .agentkit/agentkit.py prompt <步骤>`，把输出整段贴给它，再把回答整理进任务卡。
+<!-- agentkit:end -->
+
+=== CLAUDE.md
+# 给 Claude Code 的说明
+
+规则写在 AGENTS.md（所有 agent 共用），这里只负责引入。
+
+@AGENTS.md
+@.agentkit/team-workflow.md
+
+=== .claude/settings.json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|MultiEdit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.agentkit/agentkit.py\" hook pre-edit"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.agentkit/agentkit.py\" hook stop"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.agentkit/agentkit.py\" hook session-start"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Bash(python3 .agentkit/agentkit.py task confirm:*)"
+    ]
+  }
+}
+
+=== .gitignore
+.agentkit/*.local.md
+
+=== .git/hooks/pre-commit
+#!/bin/sh
+# 由 agentkit 生成：需求没确认前不提交代码
+exec python3 .agentkit/agentkit.py hook pre-commit
+
+.agentkit/prompts/handoff.md  sha256:e9b9f548f089a6de
+.agentkit/prompts/pr-desc.md  sha256:dd7a8bd926d3681c
+.agentkit/prompts/repro.md  sha256:ae9f3dcfd7095b4e
+.agentkit/prompts/restate.md  sha256:f6474930d6033140
+.agentkit/prompts/reviewer.md  sha256:c01d7f558840d67b
+.agentkit/prompts/selfcheck.md  sha256:5226d0a223e67ce2
+.agentkit/prompts/start.md  sha256:c94b9fdd87a77002
+.agentkit/prompts/verify.md  sha256:c2e34ad4a43da8f7
+.agentkit/review-format.md  sha256:d8cf951cc828bd82
+.agentkit/task-card.md  sha256:1389d2e883a3b365
+.agentkit/team-workflow.md  sha256:051d9b17e0ac96e6
+.claude/commands/handoff.md  sha256:e9b9f548f089a6de
+.claude/commands/pr-desc.md  sha256:dd7a8bd926d3681c
+.claude/commands/repro.md  sha256:ae9f3dcfd7095b4e
+.claude/commands/restate.md  sha256:9c06ce1506920647
+.claude/commands/selfcheck.md  sha256:5226d0a223e67ce2
+.claude/commands/verify.md  sha256:c2e34ad4a43da8f7
+.github/workflows/agentkit.yml  sha256:2c971600d75196ba
+
+$ agentkit init <repo>
+[exit 0]
+agentkit <version> 已安装到 <repo>
+  更新：.agentkit/review-format.md
+  更新：.agentkit/team-workflow.md
+  更新：.agentkit/task-card.md
+  更新：.agentkit/prompts/handoff.md
+  更新：.claude/commands/handoff.md
+  更新：.agentkit/prompts/pr-desc.md
+  更新：.claude/commands/pr-desc.md
+  更新：.agentkit/prompts/repro.md
+  更新：.claude/commands/repro.md
+  更新：.agentkit/prompts/restate.md
+  更新：.agentkit/prompts/reviewer.md
+  更新：.agentkit/prompts/selfcheck.md
+  更新：.claude/commands/selfcheck.md
+  更新：.agentkit/prompts/start.md
+  更新：.agentkit/prompts/verify.md
+  更新：.claude/commands/verify.md
+  更新：.github/workflows/agentkit.yml
+  更新：AGENTS.md（写入「和人协作的流程」一节，其余内容不动）
+  更新：CLAUDE.md（引入 AGENTS.md）
+  更新：GEMINI.md（指向 AGENTS.md）
+  跳过：agentkit.toml（项目自己的配置，不覆盖）
+  跳过：.claude/commands/restate.md（不是 agentkit 生成的文件，没有覆盖）
+
+下一步：检查 agentkit.toml；新任务运行 `python3 .agentkit/agentkit.py task new <任务号> <标题>`；在 GitHub 添加审查要用的密钥，并把 agentkit / task、agentkit / checks、agentkit / review 设为必须通过的检查。
+
+=== AGENTS.md
+rules
+
+<!-- agentkit:start 由 agentkit 生成：这一段升级时会被替换，文件其余内容归项目 -->
+## 和人协作的流程（agentkit）
+
+不管你是哪个 agent，都按下面做。完整约定见 `.agentkit/team-workflow.md`，开工前读一遍。
+
+1. **开工先读任务卡**：运行 `python3 .agentkit/agentkit.py task show`。任务卡记着需求、人拍板过的事、做到哪一步、试过什么不行。
+2. **需求没确认，先复述**：没有任务卡就运行 `python3 .agentkit/agentkit.py task new <任务号> <标题>`；按 `python3 .agentkit/agentkit.py prompt restate` 给出的步骤把复述写进任务卡，然后停下，请人确认。**「确认」只能由人运行 `python3 .agentkit/agentkit.py task confirm` 填写，不要自己填，也不要替人运行。**需求确认前，除了任务卡不改别的文件。
+3. **拿不准就问**：会影响做法的选择写进任务卡「要人拍板的事」，附上你的建议；人在对话里定了，就把决定、谁定的、日期记进去。
+4. **一次一步**：一次只做「拆分」里的一块，做完运行 `python3 .agentkit/agentkit.py checks` 拿证据，更新这一块的状态。
+5. **收工前交接**：更新任务卡的「交接」（做到、下一步、试过不行的），再运行 `python3 .agentkit/agentkit.py task handoff --agent <你是哪个 agent>`。
+6. **仓库的事实**：检查命令、受保护路径、高风险路径，运行 `python3 .agentkit/agentkit.py context` 查看。
+7. **项目规则**：还要遵守 `CONTRIBUTING.md`。
+8. **本仓库**：最终记录写在 changes/
+
+没有仓库权限的聊天机器人：由人运行 `python3 .agentkit/agentkit.py prompt <步骤>`，把输出整段贴给它，再把回答整理进任务卡。
+<!-- agentkit:end -->
+
+=== CLAUDE.md
+# 给 Claude Code 的说明
+
+规则写在 AGENTS.md（所有 agent 共用），这里只负责引入。
+
+@AGENTS.md
+@.agentkit/team-workflow.md
+
+@CONTRIBUTING.md
+
+=== GEMINI.md
+<!-- agentkit:start 由 agentkit 生成 -->
+本仓库的协作流程写在 `AGENTS.md`。开工前先读它，并按其中「和人协作的流程（agentkit）」一节做。
+<!-- agentkit:end -->
+
+$ agentkit context
+[exit 0]
+# 本仓库的 agentkit 配置（来自 agentkit.toml）
+
+- 写代码时遵守：`AGENTS.md`、`CONTRIBUTING.md`；流程见 AGENTS.md 的 agentkit 一节和 `.agentkit/team-workflow.md`
+- 需求在哪：任务卡 `docs/tasks/<任务号>.md`（当前任务运行 `python3 .agentkit/agentkit.py task show`）；没有任务卡时看 PR 描述
+- 每次都跑的检查：`python3 -c "import os, sys; bad = os.path.exists('FAIL'); print('FAIL is here' if bad else 'ok'); sys.exit(1 if bad else 0)"`
+- 改到 `src/**` 时加跑：`python3 -c "import sys; print('boom'); sys.exit(3)"`
+- 受保护路径（不能改）：`vendor/**`
+- 高风险路径（改到就至少高风险）：`.github/workflows/**`、`agentkit.toml`、`.agentkit/**`、`.claude/settings.json`
+- 建议人审人数：低 0、中 1、高 2
+- 运行检查并拿到证据：`python3 .agentkit/agentkit.py checks`
+- AI 审查者：本地 `good`、`good`、`bad`（`python3 .agentkit/agentkit.py review`）；CI `claude-action`
+
+$ agentkit context --for review
+[exit 0]
+# 本仓库的 agentkit 配置（来自 agentkit.toml）
+
+- 写代码时遵守：`AGENTS.md`、`CONTRIBUTING.md`；流程见 AGENTS.md 的 agentkit 一节和 `.agentkit/team-workflow.md`
+- 审查时按顺序读：`AGENTS.md`、`CONTRIBUTING.md`、`REVIEW.md`、`.agentkit/review-format.md`
+- 项目自己的审查规则和 review-format.md 冲突时，以项目规则为准；输出格式始终按 review-format.md
+- 需求在哪：任务卡 `docs/tasks/<任务号>.md`（当前任务运行 `python3 .agentkit/agentkit.py task show`）；没有任务卡时看 PR 描述
+- 每次都跑的检查：`python3 -c "import os, sys; bad = os.path.exists('FAIL'); print('FAIL is here' if bad else 'ok'); sys.exit(1 if bad else 0)"`
+- 改到 `src/**` 时加跑：`python3 -c "import sys; print('boom'); sys.exit(3)"`
+- 受保护路径（不能改）：`vendor/**`
+- 高风险路径（改到就至少高风险）：`.github/workflows/**`、`agentkit.toml`、`.agentkit/**`、`.claude/settings.json`
+- 建议人审人数：低 0、中 1、高 2
+- 运行检查并拿到证据：`python3 .agentkit/agentkit.py checks`
+- AI 审查者：本地 `good`、`good`、`bad`（`python3 .agentkit/agentkit.py review`）；CI `claude-action`
+
+$ agentkit task list
+[exit 0]
+没有找到当前任务的任务卡。
+- 新任务：运行 `python3 .agentkit/agentkit.py task new <任务号> <一句话标题>`，把复述写进任务卡，请人确认。
+- 接着做已有的任务：运行 `python3 .agentkit/agentkit.py task use <任务号>`。现在还没有任务卡。
+
+$ agentkit task show
+[exit 0]
+没有找到当前任务的任务卡。
+- 新任务：运行 `python3 .agentkit/agentkit.py task new <任务号> <一句话标题>`，把复述写进任务卡，请人确认。
+- 接着做已有的任务：运行 `python3 .agentkit/agentkit.py task use <任务号>`。现在还没有任务卡。
+
+$ agentkit hook session-start
+[exit 0]
+agentkit：本仓库按任务卡协作，流程见 AGENTS.md 和 .agentkit/team-workflow.md。
+没有找到当前任务的任务卡。
+- 新任务：运行 `python3 .agentkit/agentkit.py task new <任务号> <一句话标题>`，把复述写进任务卡，请人确认。
+- 接着做已有的任务：运行 `python3 .agentkit/agentkit.py task use <任务号>`。现在还没有任务卡。
+
+$ agentkit hook pre-edit
+[exit 2]
+stderr| agentkit：本仓库要求每个改动都有任务卡（agentkit.toml 的 tasks.required），现在没有当前任务卡，先别改代码。先运行 `python3 .agentkit/agentkit.py task new <任务号> <标题>`，把复述写进任务卡，请人确认；已有任务卡就请人运行 `python3 .agentkit/agentkit.py task use <任务号>`。
+
+$ agentkit hook pre-edit
+[exit 2]
+stderr| agentkit：vendor/x.txt 是受保护路径（vendor/**，见 agentkit.toml），不能直接修改。如果确实需要改，停下来说明原因，请人决定。
+
+$ agentkit task new bad id
+[exit 1]
+stderr| 任务号只能用字母、数字、点、横线和下划线，比如 WIP-123
+
+$ agentkit task new WIP-1 下单库存不足
+[exit 0]
+已新建任务卡 docs/tasks/WIP-1.md，并设为当前任务。
+下一步：
+1. 让 agent 复述需求、写进这张卡：Claude Code 用 /restate；其他 agent 运行 `python3 .agentkit/agentkit.py prompt restate "<需求>"`。
+2. 人看过之后，在自己的终端里运行 `python3 .agentkit/agentkit.py task confirm WIP-1`。
+
+$ agentkit task new WIP-1
+[exit 1]
+任务卡已经存在：docs/tasks/WIP-1.md，已设为当前任务。运行 `python3 .agentkit/agentkit.py task show` 查看。
+
+$ agentkit task show
+[exit 0]
+任务卡 `docs/tasks/WIP-1.md`（当前任务（task new / task use 设置的））：
+
+# WIP-1 下单库存不足
+
+<!-- agentkit 任务卡。人和所有 agent 共用：开工先读（agentkit task show），收工前更新「交接」（agentkit task handoff）。 -->
+
+## 需求
+
+<!-- 三问都要填。agent 可以先写自己的理解，拿不准的标「待确认」。
+「确认」只能由人运行 agentkit task confirm 填写；确认之后再改需求，确认会失效，要人重新确认。 -->
+
+- 满足谁：
+- 解决什么：
+- 怎么算做完：
+- 确认：
+
+## 要人拍板的事
+
+<!-- 会影响做法、agent 不该自己定的事。
+没定：- [ ] 问题（建议：……）
+定了：- [x] 问题 → 决定（谁定的，在哪定的，日期） -->
+
+## 拆分
+
+<!-- 每块都能单独验证，最好一块一个 PR。状态写在方括号里：[todo] [doing] [done]
+1. [todo] …… -->
+
+## 交接
+
+<!-- 收工前更新，让下一个人或下一个 agent 能直接接着做。 -->
+
+- 做到：
+- 下一步：
+- 试过不行的：
+
+## 记录
+
+<!-- agentkit task handoff 自动追加：时间、谁、哪个 agent、分支、进度。 -->
+
+---
+状态（agentkit 读出来的）：
+- 需求：还缺 「满足谁」、「解决什么」、「怎么算做完」
+- 确认：**还没有**。先把复述写进任务卡，再请人运行 `python3 .agentkit/agentkit.py task confirm WIP-1`
+- 要人拍板：没有待定的事
+- 拆分：还没拆
+- 下一步：（「交接」里还没写）
+
+按约定：需求被人确认之前，除了这张任务卡，不要改别的文件。
+本仓库：最终记录写在 changes/
+
+$ agentkit task show --brief
+[exit 0]
+当前任务：WIP-1 下单库存不足（`docs/tasks/WIP-1.md`，当前任务（task new / task use 设置的））
+状态（agentkit 读出来的）：
+- 需求：还缺 「满足谁」、「解决什么」、「怎么算做完」
+- 确认：**还没有**。先把复述写进任务卡，再请人运行 `python3 .agentkit/agentkit.py task confirm WIP-1`
+- 要人拍板：没有待定的事
+- 拆分：还没拆
+- 下一步：（「交接」里还没写）
+
+按约定：需求被人确认之前，除了这张任务卡，不要改别的文件。
+本仓库：最终记录写在 changes/
+
+$ agentkit prompt
+[exit 0]
+工作流程的提示词，任何 agent 都能用。没有仓库权限的聊天机器人：由人把输出整段贴给它。
+
+- handoff：收工前更新任务卡的拆分状态和交接，让下一个人或 agent 能接着做
+- pr-desc：按仓库的 PR 模板写 PR 描述，附上任务卡和真实的检查结果
+- repro：先写一个会失败的测试把问题重现出来，不改实现
+- restate：先复述需求、写进任务卡、列出要人拍板的事，不改代码
+- reviewer：给审查者的提示词（agentkit review 和 CI 自动使用，下面会附上全部材料）
+- selfcheck：以审查者的身份审当前改动（请在新开的会话里运行）
+- start：给任何 agent 或聊天机器人的开场白：说明流程，读任务卡，说出下一步
+- verify：按改动运行本仓库的检查，对照「怎么算做完」逐条说明
+
+用法：python3 .agentkit/agentkit.py prompt <名字> [补充说明]
+
+$ agentkit prompt restate 下单时库存不足要提示
+[exit 0]
+先别写代码。这一步只允许新建或修改任务卡。
+
+需求：
+下单时库存不足要提示
+
+1. 运行 `python3 .agentkit/agentkit.py task show`，看有没有当前任务卡。没有的话，问我任务号，再运行 `python3 .agentkit/agentkit.py task new <任务号> <一句话标题>`。
+2. 读相关代码。能运行的话，用最小的命令或脚本确认问题真的存在（不要改文件），记下关键输出。
+3. 把下面这些写进任务卡：
+   - 「需求」：用自己的话写满足谁、解决什么、怎么算做完。「怎么算做完」要能检查，比如具体的返回值、页面上能看到什么、哪个测试通过。我没说清的地方写你的理解，标上「待确认」。**不要填「确认」那一行。**
+   - 「要人拍板的事」：你拿不准、会影响做法的地方，比如改在哪个模块、报错方式、边界情况、要不要顺带处理相关问题。每条一行：`- [ ] 问题（建议：……）`。
+   - 「拆分」：改动会超过 300 行或跨多个模块的，拆成几块，每块能单独验证，写成 `1. [todo] ……`。不用拆就只写一块。
+4. 在对话里用不超过 300 字告诉我：你的理解、现状、要我拍板的事、拆分建议。
+
+然后停下，等我确认。我会在自己的终端运行 `python3 .agentkit/agentkit.py task confirm`；在那之前不要动代码。
+
+---
+当前任务卡（`docs/tasks/WIP-1.md`）：
+
+# WIP-1 下单库存不足
+
+<!-- agentkit 任务卡。人和所有 agent 共用：开工先读（agentkit task show），收工前更新「交接」（agentkit task handoff）。 -->
+
+## 需求
+
+<!-- 三问都要填。agent 可以先写自己的理解，拿不准的标「待确认」。
+「确认」只能由人运行 agentkit task confirm 填写；确认之后再改需求，确认会失效，要人重新确认。 -->
+
+- 满足谁：
+- 解决什么：
+- 怎么算做完：
+- 确认：
+
+## 要人拍板的事
+
+<!-- 会影响做法、agent 不该自己定的事。
+没定：- [ ] 问题（建议：……）
+定了：- [x] 问题 → 决定（谁定的，在哪定的，日期） -->
+
+## 拆分
+
+<!-- 每块都能单独验证，最好一块一个 PR。状态写在方括号里：[todo] [doing] [done]
+1. [todo] …… -->
+
+## 交接
+
+<!-- 收工前更新，让下一个人或下一个 agent 能直接接着做。 -->
+
+- 做到：
+- 下一步：
+- 试过不行的：
+
+## 记录
+
+<!-- agentkit task handoff 自动追加：时间、谁、哪个 agent、分支、进度。 -->
+
+$ agentkit prompt nope
+[exit 1]
+stderr| 没有叫 nope 的提示词。运行 `python3 .agentkit/agentkit.py prompt` 查看全部。
+
+$ agentkit hook pre-edit
+[exit 2]
+stderr| agentkit：当前任务 WIP-1 的需求还没有人确认（或确认后又改过），先别改代码。把复述写进任务卡 docs/tasks/WIP-1.md，停下来请人运行 `python3 .agentkit/agentkit.py task confirm WIP-1`。如果这次做的不是这个任务，请人运行 `python3 .agentkit/agentkit.py task use --clear` 或 `task use <任务号>`。
+
+$ agentkit hook pre-edit
+[exit 2]
+stderr| agentkit：任务卡里的「确认」只能由人填写（人在自己的终端运行 `python3 .agentkit/agentkit.py task confirm`）。你可以写复述、列出要拍板的事，然后停下请人确认。
+
+$ agentkit task confirm
+[exit 2]
+stderr| 确认需求要由人在自己的终端里运行这条命令；agent 不能替人确认。
+
+$ agentkit task handoff
+[exit 1]
+stderr| 先在任务卡的「交接」里写清「做到」、「下一步」，再运行这条命令。
+
+$ agentkit task show --brief
+[exit 0]
+当前任务：WIP-1 下单时库存不足要提示（`docs/tasks/WIP-1.md`，当前任务（task new / task use 设置的））
+状态（agentkit 读出来的）：
+- 需求：三问都写了
+- 确认：**还没有**。先把复述写进任务卡，再请人运行 `python3 .agentkit/agentkit.py task confirm WIP-1`
+- 要人拍板：还有 1 件没定：多件商品时整单失败还是只去掉缺货的？（建议：整单失败）
+- 拆分：完成 1/3；正在做：前端显示提示
+- 下一步：结账页处理 409
+
+按约定：需求被人确认之前，除了这张任务卡，不要改别的文件。
+本仓库：最终记录写在 changes/
+
+$ agentkit task confirm WIP-1  # a person types 'n\n'
+[exit 1]
+任务 WIP-1 下单时库存不足要提示 的需求：
+
+- 满足谁：下单的用户
+- 解决什么：库存不足时现在返回 500
+- 怎么算做完：
+  - 返回 409 和“库存不足”
+- 确认：
+
+注意：还有 1 件事没拍板（确认需求不代表这些也定了）：
+  - 多件商品时整单失败还是只去掉缺货的？（建议：整单失败）
+
+这就是你要的吗？输入 y 确认：没有确认。可以让 agent 按你的意见改任务卡，再运行一次。
+
+$ agentkit hook pre-commit
+[exit 1]
+stderr| agentkit：要提交的任务卡（暂存区里的 docs/tasks/WIP-1.md）显示任务 WIP-1 的需求还没有人确认（或确认后又改过），先不提交代码。请人运行 `python3 .agentkit/agentkit.py task confirm WIP-1`，再 `git add docs/tasks/WIP-1.md`；如果这次提交不属于这个任务，运行 `python3 .agentkit/agentkit.py task use --clear`。
+
+$ agentkit task check --base main --committed-only
+[exit 1]
+### 任务卡检查（agentkit task check）
+
+#### WIP-1 下单时库存不足要提示（`docs/tasks/WIP-1.md`）
+
+- 需求：三问都写了
+- 确认：**还没有**。先把复述写进任务卡，再请人运行 `python3 .agentkit/agentkit.py task confirm WIP-1`
+- 要人拍板：还有 1 件没定：多件商品时整单失败还是只去掉缺货的？（建议：整单失败）
+- 拆分：完成 1/3；正在做：前端显示提示
+- 下一步：结账页处理 409
+
+**不通过：**
+- WIP-1：需求还没有人确认（请人运行 `python3 .agentkit/agentkit.py task confirm WIP-1`）
+
+**提醒：**
+- WIP-1：还有 1 件事没拍板
+
+$ agentkit task confirm WIP-1  # a person types 'y\n'
+[exit 0]
+任务 WIP-1 下单时库存不足要提示 的需求：
+
+- 满足谁：下单的用户
+- 解决什么：库存不足时现在返回 500
+- 怎么算做完：
+  - 返回 409 和“库存不足”
+- 确认：
+
+注意：还有 1 件事没拍板（确认需求不代表这些也定了）：
+  - 多件商品时整单失败还是只去掉缺货的？（建议：整单失败）
+
+这就是你要的吗？输入 y 确认：已确认。记得把 docs/tasks/WIP-1.md 提交；agent 现在可以按「拆分」动手了。
+
+=== docs/tasks/WIP-1.md
+# WIP-1 下单时库存不足要提示
+
+## 需求
+
+- 满足谁：下单的用户
+- 解决什么：库存不足时现在返回 500
+- 怎么算做完：
+  - 返回 409 和“库存不足”
+- 确认：t，<today>（需求指纹 d4e11033）
+
+## 要人拍板的事
+
+- [x] 用 409 还是 400 → 409（产品，对话，11-01）
+- [ ] 多件商品时整单失败还是只去掉缺货的？（建议：整单失败）
+
+## 拆分
+
+1. [done] 下单接口检查库存
+2. [doing] 前端显示提示
+3. [todo] 多件商品
+
+## 交接
+
+- 做到：接口已合入
+- 下一步：结账页处理 409
+- 试过不行的：
+
+## 记录
+
+$ agentkit task show --brief
+[exit 0]
+当前任务：WIP-1 下单时库存不足要提示（`docs/tasks/WIP-1.md`，分支名 feature/WIP-1-stock）
+状态（agentkit 读出来的）：
+- 需求：三问都写了
+- 确认：t，<today>
+- 要人拍板：还有 1 件没定：多件商品时整单失败还是只去掉缺货的？（建议：整单失败）
+- 拆分：完成 1/3；正在做：前端显示提示
+- 下一步：结账页处理 409
+
+按约定：一次只做「拆分」里的一块，做完运行 `python3 .agentkit/agentkit.py checks` 拿证据；收工前更新「交接」，再运行 `python3 .agentkit/agentkit.py task handoff --agent <你是哪个 agent>`。
+本仓库：最终记录写在 changes/
+
+$ agentkit hook pre-commit
+[exit 0]
+
+$ agentkit hook pre-edit
+[exit 0]
+
+$ agentkit checks --base main
+[exit 1]
+### 自动检查（agentkit checks）
+
+对比：`<commit 1>` → `<commit 3>（含未提交的改动）`；改动文件 3 个。
+
+| 命令 | 为什么跑 | 结果 | 用时 |
+|---|---|---|---|
+| `python3 -c "import os, sys; bad = os.path.exists('FAIL'); print('FAIL is here' if bad else 'ok'); sys.exit(1 if bad else 0)"` | 每次都跑 | 通过 | <seconds> |
+| `python3 -c "import sys; print('boom'); sys.exit(3)"` | 改到 src/a.py | **失败**（退出码 3） | <seconds> |
+
+<details><summary><code>python3 -c "import sys; print('boom'); sys.exit(3)"</code> 的最后 30 行输出</summary>
+
+```text
+boom
+```
+
+</details>
+
+没有专门检查覆盖的改动：`.github/workflows/ci.yml`、`docs/tasks/WIP-1.md`（只跑了每次都跑的检查）。
+
+$ agentkit hook stop
+[exit 2]
+stderr| agentkit：结束前的自动检查没通过：
+stderr| - `python3 -c "import os, sys; bad = os.path.exists('FAIL'); print('FAIL is here' if bad else 'ok'); sys.exit(1 if bad else 0)"` 退出码 1
+stderr| FAIL is here
+stderr| 请修好后再结束；如果这次不该修，说明原因。
+stderr| agentkit：这次改了代码，但任务卡 docs/tasks/WIP-1.md 还没更新。收工前更新「拆分」的状态和「交接」（做到、下一步、试过不行的），再运行 `python3 .agentkit/agentkit.py task handoff --agent "Claude Code"`。
+
+$ agentkit hook stop
+[exit 0]
+
+$ agentkit task handoff --agent Kimi
+[exit 0]
+已记下交接：
+- <time> · t · Kimi · feature/WIP-1-stock@<commit 3> · 拆分完成 1/3 · 下一步：结账页处理 409
+
+- 需求：三问都写了
+- 确认：t，<today>
+- 要人拍板：还有 1 件没定：多件商品时整单失败还是只去掉缺货的？（建议：整单失败）
+- 拆分：完成 1/3；正在做：前端显示提示
+- 下一步：结账页处理 409
+
+=== docs/tasks/WIP-1.md
+# WIP-1 下单时库存不足要提示
+
+## 需求
+
+- 满足谁：下单的用户
+- 解决什么：库存不足时现在返回 500
+- 怎么算做完：
+  - 返回 409 和“库存不足”
+- 确认：t，<today>（需求指纹 d4e11033）
+
+## 要人拍板的事
+
+- [x] 用 409 还是 400 → 409（产品，对话，11-01）
+- [ ] 多件商品时整单失败还是只去掉缺货的？（建议：整单失败）
+
+## 拆分
+
+1. [done] 下单接口检查库存
+2. [doing] 前端显示提示
+3. [todo] 多件商品
+
+## 交接
+
+- 做到：前端提示也做完了
+- 下一步：结账页处理 409
+- 试过不行的：
+
+## 记录
+
+- <time> · t · Kimi · feature/WIP-1-stock@<commit 3> · 拆分完成 1/3 · 下一步：结账页处理 409
+
+$ agentkit hook session-start
+[exit 0]
+agentkit：本仓库按任务卡协作，流程见 AGENTS.md 和 .agentkit/team-workflow.md。
+当前任务：WIP-1 下单时库存不足要提示（分支名 feature/WIP-1-stock）
+- 需求：三问都写了
+- 确认：t，<today>
+- 要人拍板：还有 1 件没定：多件商品时整单失败还是只去掉缺货的？（建议：整单失败）
+- 拆分：完成 1/3；正在做：前端显示提示
+- 下一步：结账页处理 409
+开工前先运行 `python3 .agentkit/agentkit.py task show` 读完整任务卡。
+按约定：一次只做「拆分」里的一块，做完运行 `python3 .agentkit/agentkit.py checks` 拿证据；收工前更新「交接」，再运行 `python3 .agentkit/agentkit.py task handoff --agent <你是哪个 agent>`。
+
+$ agentkit task list
+[exit 0]
+* WIP-1 下单时库存不足要提示：已确认，拆分 1/3，待拍板 1
+
+$ agentkit task check --base main --committed-only --branch feature/WIP-1-stock
+[exit 0]
+### 任务卡检查（agentkit task check）
+
+#### WIP-1 下单时库存不足要提示（`docs/tasks/WIP-1.md`）
+
+- 需求：三问都写了
+- 确认：t，<today>
+- 要人拍板：还有 1 件没定：多件商品时整单失败还是只去掉缺货的？（建议：整单失败）
+- 拆分：完成 1/3；正在做：前端显示提示
+- 下一步：结账页处理 409
+
+**提醒：**
+- WIP-1：还有 1 件事没拍板
+
+$ agentkit review --base main
+[exit 0]
+并行运行 3 位审查者，每位都是新开的独立会话：good#1、good#2、bad
+- good#1：完成，1 个问题，风险初判中
+- good#2：完成，1 个问题，风险初判中
+- bad：结果格式不对：没有找到 ai-review-result 段（原始输出在 .agentkit/review.bad.local.md）
+合并结果已写入 .agentkit/review.local.md
+本地预判：风险高，建议 2 人审，2 个已确认的 Important 要先修。
+
+=== .agentkit/review.local.md
+## AI 审查（2 位独立审查者：good#1、good#2）
+
+| 位置 | 级别 | 谁说了什么 |
+|---|---|---|
+| `src/a.py:1` | Important · 已确认 | **good#1**（Important）：库存检查漏了并发<br>**good#2**（Important）：库存检查漏了并发 |
+
+**风险初判：中**（取各审查者里最高的）
+
+分数（取各审查者里最低的）：符合需求 4/5 · 测试与证据 3/5 · 边界与风险 3/5 · 好读好改 4/5
+
+规则：同一处 Important 要有 2 位审查者都提出，并且已确认，才阻断合入。
+
+没跑成的审查者：bad（格式不对：没有找到 ai-review-result 段）
+
+<details><summary>good#1 的完整审查</summary>
+
+## AI 审查
+
+正文
+
+</details>
+
+<details><summary>good#2 的完整审查</summary>
+
+## AI 审查
+
+正文
+
+</details>
+
+<!-- ai-review-result
+{"scores": {"requirement": 4, "evidence": 3, "risk": 3, "readability": 4}, "risk_level": "medium", "issues": [{"file": "src/a.py", "line": 1, "severity": "important", "confirmed": true, "summary": "库存检查漏了并发", "reviewer": "good#1"}, {"file": "src/a.py", "line": 1, "severity": "important", "confirmed": true, "summary": "库存检查漏了并发", "reviewer": "good#2"}], "reviewers": ["good#1", "good#2"], "failed_reviewers": ["bad"]}
+-->
+
+$ agentkit review --print-prompt --base main
+[exit 0]
+你是这次改动的审查者，没有参与写这段代码。你在一个新的会话里，看不到写代码时的对话，只根据下面附上的材料和仓库里的代码判断。
+
+要审的改动：`main` 之后的全部改动，**包括还没提交的**（工作区里的修改和新文件）。下面附上的 diff 就是这个范围，以它为准。
+
+1. 读下面附上的项目规则和审查格式。项目自己的审查规则和审查格式冲突时，以项目规则为准；输出格式始终按审查格式。
+2. 读任务卡。需求和「怎么算做完」以任务卡为准；任务卡里人已经拍板的事，不要再当成问题提。没有任务卡时看 PR 描述。
+3. 读完整改动。能运行命令的话，可以用 `git diff <commit 1>`（看工作区）和 `git status`、读文件来看上下文，必要时实际运行来验证。不要只看已提交的代码就下结论。
+4. 自动检查的结果在下面，把它当作证据。
+5. 只报告你能指出具体位置的问题。没验证过的问题照样报，`confirmed` 写 `false`。
+6. 按审查格式输出完整结果，结尾必须有 ai-review-result 段。
+
+不要修改任何文件。把完整结果作为你的最终回复直接输出，前后不要加别的话。
+
+---
+
+## 项目规则：AGENTS.md
+
+rules
+
+<!-- agentkit:start 由 agentkit 生成：这一段升级时会被替换，文件其余内容归项目 -->
+## 和人协作的流程（agentkit）
+
+不管你是哪个 agent，都按下面做。完整约定见 `.agentkit/team-workflow.md`，开工前读一遍。
+
+1. **开工先读任务卡**：运行 `python3 .agentkit/agentkit.py task show`。任务卡记着需求、人拍板过的事、做到哪一步、试过什么不行。
+2. **需求没确认，先复述**：没有任务卡就运行 `python3 .agentkit/agentkit.py task new <任务号> <标题>`；按 `python3 .agentkit/agentkit.py prompt restate` 给出的步骤把复述写进任务卡，然后停下，请人确认。**「确认」只能由人运行 `python3 .agentkit/agentkit.py task confirm` 填写，不要自己填，也不要替人运行。**需求确认前，除了任务卡不改别的文件。
+3. **拿不准就问**：会影响做法的选择写进任务卡「要人拍板的事」，附上你的建议；人在对话里定了，就把决定、谁定的、日期记进去。
+4. **一次一步**：一次只做「拆分」里的一块，做完运行 `python3 .agentkit/agentkit.py checks` 拿证据，更新这一块的状态。
+5. **收工前交接**：更新任务卡的「交接」（做到、下一步、试过不行的），再运行 `python3 .agentkit/agentkit.py task handoff --agent <你是哪个 agent>`。
+6. **仓库的事实**：检查命令、受保护路径、高风险路径，运行 `python3 .agentkit/agentkit.py context` 查看。
+7. **项目规则**：还要遵守 `CONTRIBUTING.md`。
+8. **本仓库**：最终记录写在 changes/
+
+没有仓库权限的聊天机器人：由人运行 `python3 .agentkit/agentkit.py prompt <步骤>`，把输出整段贴给它，再把回答整理进任务卡。
+<!-- agentkit:end -->
+
+
+---
+
+## 项目规则：CONTRIBUTING.md
+
+contributing
+
+
+---
+
+## 项目规则：REVIEW.md
+
+review rules
+
+
+---
+
+## 审查格式
+
+# 审查格式
+
+
+
+GitHub 上的自动审查、本地的 `agentkit review` 和 `/selfcheck` 都用这份格式，不管审查者是哪个 agent 或模型。项目自己的审查规则（`agentkit.toml` 的 `rules.review`）优先；这份文件只规定打分标准、问题分级和输出格式。
+
+## 你的角色
+
+你是审查者，没有参与写这段代码。不护短，也不为了显得有用而挑刺。需求以任务卡为准（没有任务卡时看 PR 描述）；任务卡里人已经拍板的事，不要再当成问题提。需求或完成标准缺失，本身就是一个 Important 问题。
+
+## 问题分级（和 Claude Code Review 一致）
+
+- **Important**：影响正确性、安全、隐私或交付条件，应该在合入前修复。
+- **Nit**：可选的小改进，不阻断合入。最多报 3 条。
+- **Pre-existing**：这次改动之前就存在的问题。如果这次改动让它能被触发，或者影响变大，按 Important 报。
+- 能实际跑一下验证的，先验证再报，`confirmed` 填 `true`；没把握、没验证的照样报，`confirmed` 填 `false`。只有已确认的 Important 会阻断合入。
+
+## 报问题的规矩
+
+- 每个问题写清：`文件:行号`、触发条件、为什么是问题、怎么改。
+- 风格和格式问题交给 lint，不报。同类问题合并成一条。最多报 8 条，按严重程度排序。
+- 如果 PR 上已经有两次以上 AI 审查，只报 Important，并且只看新改动和受影响的路径。
+
+## 打分（每项 1–5 分，各写一句理由）
+
+| 项目 | 5 分 | 3 分 | 1 分 |
+|---|---|---|---|
+| 符合需求 | 完成标准的每一条都做到了 | 主体做到，有遗漏 | 做的不是需求要的 |
+| 测试与证据 | 先有失败测试再修复，覆盖每一条，贴了真实结果 | 有测试但没覆盖关键边界，或没贴结果 | 没有测试也没有证据 |
+| 边界与风险 | 权限、错误输入、并发、回滚都考虑到了 | 有明显没覆盖的边界 | 会造成数据错误、越权或泄露 |
+| 好读好改 | 改动聚焦、命名和边界清楚 | 能看懂但要花时间 | 很难看懂，或改动远超需求范围 |
+
+需求找不到时，“符合需求”填 `null`。
+
+## 风险初判
+
+你给的是初判。工具会按 `agentkit.toml` 的高风险路径往上调，不会往下调。
+
+- **high**：安全、权限、钱、删除或迁移数据、对外契约不兼容、CI / 发布 / 审查门禁本身的修改
+- **medium**：业务逻辑、共享模块、对外接口
+- **low**：文档、测试、样式、有测试覆盖的小改动
+
+## 输出模板（严格照这个格式）
+
+```markdown
+## AI 审查
+
+| 项目 | 分数 | 理由 |
+|---|---|---|
+| 符合需求 | x/5 | 一句话 |
+| 测试与证据 | x/5 | 一句话 |
+| 边界与风险 | x/5 | 一句话 |
+| 好读好改 | x/5 | 一句话 |
+
+**风险初判：低 / 中 / 高**：一句话理由
+
+### 问题
+1. `文件:行号`［Important / Nit / Pre-existing］［已验证 / 待确认］问题 → 为什么 → 怎么改
+
+（没有问题就写：没有发现需要改的问题。）
+
+### 给人审的人
+- 最值得人看的 1–3 处，以及为什么
+
+
+```
+
+最后的 `ai-review-result` 必须是一行合法的 JSON：
+
+- `scores`：每项 1–5 的整数；“符合需求”无法判断时填 `null`。
+- `risk_level`：`low`、`medium` 或 `high`。
+- `issues`：和上面列出的问题一一对应，没有问题就是 `[]`。每项包含 `file`、`line`（整数或 `null`）、`severity`（`important`、`nit`、`pre-existing`）、`confirmed`（`true` 或 `false`）、`summary`。
+- 轮次、head、最终风险和建议人数由工具填写，你不用写。
+
+能运行命令的话，写完运行 `python3 .agentkit/agentkit.py validate <文件>`，不通过就改到通过。
+
+---
+
+## 任务卡（docs/tasks/WIP-1.md）
+
+# WIP-1 下单时库存不足要提示
+
+## 需求
+
+- 满足谁：下单的用户
+- 解决什么：库存不足时现在返回 500
+- 怎么算做完：
+  - 返回 409 和“库存不足”
+- 确认：t，<today>（需求指纹 d4e11033）
+
+## 要人拍板的事
+
+- [x] 用 409 还是 400 → 409（产品，对话，11-01）
+- [ ] 多件商品时整单失败还是只去掉缺货的？（建议：整单失败）
+
+## 拆分
+
+1. [done] 下单接口检查库存
+2. [doing] 前端显示提示
+3. [todo] 多件商品
+
+## 交接
+
+- 做到：前端提示也做完了
+- 下一步：结账页处理 409
+- 试过不行的：
+
+## 记录
+
+- <time> · t · Kimi · feature/WIP-1-stock@<commit 3> · 拆分完成 1/3 · 下一步：结账页处理 409
+
+---
+
+## 改动的文件（3 个）
+
+- .github/workflows/ci.yml
+- docs/tasks/WIP-1.md
+- src/a.py
+
+---
+
+## 完整改动（diff）
+
+```diff
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+new file mode 100644
+index <blobs>
+--- /dev/null
++++ b/.github/workflows/ci.yml
+@@ -0,0 +1 @@
++name: ci
+diff --git a/docs/tasks/WIP-1.md b/docs/tasks/WIP-1.md
+new file mode 100644
+index <blobs>
+--- /dev/null
++++ b/docs/tasks/WIP-1.md
+@@ -0,0 +1,30 @@
++# WIP-1 下单时库存不足要提示
++
++## 需求
++
++- 满足谁：下单的用户
++- 解决什么：库存不足时现在返回 500
++- 怎么算做完：
++  - 返回 409 和“库存不足”
++- 确认：t，<today>（需求指纹 d4e11033）
++
++## 要人拍板的事
++
++- [x] 用 409 还是 400 → 409（产品，对话，11-01）
++- [ ] 多件商品时整单失败还是只去掉缺货的？（建议：整单失败）
++
++## 拆分
++
++1. [done] 下单接口检查库存
++2. [doing] 前端显示提示
++3. [todo] 多件商品
++
++## 交接
++
++- 做到：前端提示也做完了
++- 下一步：结账页处理 409
++- 试过不行的：
++
++## 记录
++
++- <time> · t · Kimi · feature/WIP-1-stock@<commit 3> · 拆分完成 1/3 · 下一步：结账页处理 409
+diff --git a/src/a.py b/src/a.py
+index <blobs> 100644
+--- a/src/a.py
++++ b/src/a.py
+@@ -1 +1 @@
+-x = 1
++x = 3
+
+```
+
+$ agentkit review --ci --plan
+[exit 0]
+action=true
+engines=claude-action
+
+$ agentkit gate --review review-fail.md --base main --head abcdef1234567 --dry-run
+[exit 1]
+## AI 审查
+
+正文
+
+---
+**agentkit 判定**（第 1 轮，head `abcdef1`）：风险 **高**（AI 初判为中；按 agentkit.toml 的路径规则上调：改到 `.github/workflows/ci.yml`）；建议 2 人审；有 1 个已确认的 Important 问题，修复前不通过。
+
+<!-- ai-review-result
+{"scores": {"requirement": 4, "evidence": 3, "risk": 3, "readability": 4}, "risk_level": "high", "issues": [{"file": "src/a.py", "line": 1, "severity": "important", "confirmed": true, "summary": "库存检查漏了并发"}], "head": "abcdef1234567", "round": 1, "ai_risk_level": "medium", "reviewers_needed": 2}
+-->
+
+{"round": 1, "risk_level": "high", "ai_risk_level": "medium", "reviewers_needed": 2, "labels": ["risk:high"], "passed": false}
+stderr| 不通过：1 个已确认的 Important 问题。
+
+$ agentkit gate --review review-pass.md --base main --head abcdef1234567 --dry-run
+[exit 0]
+## AI 审查
+
+正文
+
+---
+**agentkit 判定**（第 1 轮，head `abcdef1`）：风险 **高**（AI 初判为中；按 agentkit.toml 的路径规则上调：改到 `.github/workflows/ci.yml`）；建议 2 人审；没有已确认的 Important 问题，检查通过；另有 1 个待确认的 Important，请人判断。
+
+<!-- ai-review-result
+{"scores": {"requirement": 4, "evidence": 3, "risk": 3, "readability": 4}, "risk_level": "high", "issues": [{"file": "src/a.py", "line": 1, "severity": "important", "confirmed": false, "summary": "库存检查漏了并发"}], "head": "abcdef1234567", "round": 1, "ai_risk_level": "medium", "reviewers_needed": 2}
+-->
+
+{"round": 1, "risk_level": "high", "ai_risk_level": "medium", "reviewers_needed": 2, "labels": ["risk:high"], "passed": true}
+
+$ agentkit validate review-pass.md
+[exit 0]
+格式正确：1 个问题，风险初判 中。
+
+$ agentkit validate bad.md
+[exit 1]
+stderr| 审查结果格式不对：
+stderr|   没有找到 ai-review-result 段
+
+$ agentkit explain-failure --file out.json --dry-run
+[exit 0]
+**agentkit**：AI 审查没有运行完，这次没有审查结果，`agentkit / review` 判为不通过。
+
+- 接口返回 `billing_error`：Credit balance is too low
+  - 处理办法：这个 key 所属的组织额度不足。如果 Console 里明明有额度，多半是 key 建在了另一个组织下：在 Console 左上角切到有额度的组织，在那里新建 key，更新仓库密钥 ANTHROPIC_API_KEY。也可以改用 Claude 订阅的 OAuth token（claude_code_oauth_token）。
+- 接口返回 `invalid_request_error`：This API key is not scoped to a workspace
+  - 处理办法：这个 key 是组织级的，没有归属到工作区。在 Console 里进入一个工作区（Workspaces → 选中工作区 → API keys）新建 key，用它更新仓库密钥 ANTHROPIC_API_KEY。
+
+处理好之后，在 Actions 页面重跑这个任务，或者推一个新提交。
+
+$ agentkit explain-failure --file empty.json --dry-run
+[exit 0]
+**agentkit**：AI 审查没有运行完，这次没有审查结果，`agentkit / review` 判为不通过。
+
+- 没有在输出里找到明确的接口错误，请到 Actions 日志里看 Claude 那一步。
+
+处理好之后，在 Actions 页面重跑这个任务，或者推一个新提交。
+
+$ agentkit risk --base main
+[exit 0]
+{
+  "floor": "high",
+  "protected": [],
+  "high_risk": [
+    ".github/workflows/ci.yml"
+  ]
+}
+
+$ agentkit task use --clear
+[exit 0]
+已清除当前任务。
+
+$ agentkit task show
+[exit 0]
+任务卡 `docs/tasks/WIP-1.md`（分支名 feature/WIP-1-stock）：
+
+# WIP-1 下单时库存不足要提示
+
+## 需求
+
+- 满足谁：下单的用户
+- 解决什么：库存不足时现在返回 500
+- 怎么算做完：
+  - 返回 409 和“库存不足”
+- 确认：t，<today>（需求指纹 d4e11033）
+
+## 要人拍板的事
+
+- [x] 用 409 还是 400 → 409（产品，对话，11-01）
+- [ ] 多件商品时整单失败还是只去掉缺货的？（建议：整单失败）
+
+## 拆分
+
+1. [done] 下单接口检查库存
+2. [doing] 前端显示提示
+3. [todo] 多件商品
+
+## 交接
+
+- 做到：前端提示也做完了
+- 下一步：结账页处理 409
+- 试过不行的：
+
+## 记录
+
+- <time> · t · Kimi · feature/WIP-1-stock@<commit 3> · 拆分完成 1/3 · 下一步：结账页处理 409
+
+---
+状态（agentkit 读出来的）：
+- 需求：三问都写了
+- 确认：t，<today>
+- 要人拍板：还有 1 件没定：多件商品时整单失败还是只去掉缺货的？（建议：整单失败）
+- 拆分：完成 1/3；正在做：前端显示提示
+- 下一步：结账页处理 409
+
+按约定：一次只做「拆分」里的一块，做完运行 `python3 .agentkit/agentkit.py checks` 拿证据；收工前更新「交接」，再运行 `python3 .agentkit/agentkit.py task handoff --agent <你是哪个 agent>`。
+本仓库：最终记录写在 changes/
+
+$ agentkit task use nope
+[exit 1]
+stderr| 没有找到当前任务的任务卡。
+stderr| - 新任务：运行 `python3 .agentkit/agentkit.py task new <任务号> <一句话标题>`，把复述写进任务卡，请人确认。
+stderr| - 接着做已有的任务：运行 `python3 .agentkit/agentkit.py task use <任务号>`。已有的任务卡：WIP-1
+
+$ agentkit task use WIP-1
+[exit 0]
+当前任务：WIP-1。运行 `python3 .agentkit/agentkit.py task show` 查看任务卡。
+
+$ agentkit hook install-git
+[exit 0]
+git pre-commit 钩子已经装好了。
+
+$ agentkit gate --review nope.md --pr 1 --base main --dry-run
+[exit 0]
+**agentkit**：这个 PR 改了审查工作流本身（`.github/workflows/agentkit.yml`）。为了防止 PR 改写自己的审查，Claude 的审查 action 只在工作流和默认分支一致时运行，所以这次 AI 审查被跳过。
+
+按规则，改门禁属于高风险：请至少 1 位负责人审过再合入。合入之后，后面的 PR 会恢复自动审查。
+{"labels": ["risk:high", "needs-human"], "passed": true, "skipped": true}
+
