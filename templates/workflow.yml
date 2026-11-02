@@ -1,10 +1,11 @@
 # 由 agentkit 生成：升级时会被覆盖。项目差异请写在 agentkit.toml。
 #
+# task：这次改动有没有任务卡、需求有没有人确认、交接有没有更新。
 # checks：按改动路径运行 agentkit.toml 里配置的检查，失败就不通过。
-# review：新开的 AI 审查这次改动，结果由 agentkit 定稿后发成一条评论、加 risk:* 标签；
-#         有已确认的 Important 问题就不通过。
-# 建议在分支保护里把 “agentkit / checks” 和 “agentkit / review” 设为必须通过。
-# 需要：仓库密钥 ANTHROPIC_API_KEY，并安装 Claude GitHub App。
+# review：agentkit.toml 里 review.ci 列出的审查者各开一个新会话审查，结果合并、定稿后发成一条评论、
+#         加 risk:* 标签；有已确认的 Important 问题就不通过。
+# 建议在分支保护里把 “agentkit / task”、“agentkit / checks”、“agentkit / review” 设为必须通过。
+# 需要：审查者用到的仓库密钥（默认的 claude-action 需要 ANTHROPIC_API_KEY，并安装 Claude GitHub App）。
 
 name: agentkit
 
@@ -17,6 +18,42 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  task:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Use the gate and config from the base branch
+        # PR 不能改自己的门禁：kit 脚本和 agentkit.toml 一律用 base 分支上的版本
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if git cat-file -e "$BASE:.agentkit/agentkit.py" 2>/dev/null; then
+            git checkout "$BASE" -- .agentkit agentkit.toml
+          else
+            echo "::warning::base 分支上还没有 agentkit（首次安装），这次使用 PR 里的版本"
+          fi
+      - name: Check the task card
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          BRANCH: ${{ github.head_ref }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if ! python3 .agentkit/agentkit.py task --help >/dev/null 2>&1; then
+            echo "::warning::base 分支上的 agentkit 还没有任务卡检查（升级中），这次跳过"
+            exit 0
+          fi
+          printf '%s' "$PR_BODY" > "$RUNNER_TEMP/pr-body.md"
+          python3 .agentkit/agentkit.py task check --base "$BASE" --committed-only --branch "$BRANCH" --pr-body-file "$RUNNER_TEMP/pr-body.md"
+
   checks:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -31,7 +68,6 @@ jobs:
         with:
           python-version: "3.12"
       - name: Use the gate and config from the base branch
-        # PR 不能改自己的门禁：kit 脚本和 agentkit.toml 一律用 base 分支上的版本
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
         run: |
@@ -69,7 +105,6 @@ jobs:
         with:
           python-version: "3.12"
       - name: Use the gate and config from the base branch
-        # PR 不能改自己的门禁：kit 脚本和 agentkit.toml 一律用 base 分支上的版本
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
         run: |
@@ -82,8 +117,19 @@ jobs:
         continue-on-error: true
         with:
           name: agentkit-checks
+      - name: Decide which reviewers run
+        id: plan
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          printf '%s' "$PR_BODY" > "$RUNNER_TEMP/pr-body.md"
+          python3 .agentkit/agentkit.py review --ci --plan | tee -a "$GITHUB_OUTPUT"
+          python3 .agentkit/agentkit.py review --ci --print-prompt --base "$BASE" --evidence checks.md \
+            --pr-body-file "$RUNNER_TEMP/pr-body.md" --output-file review-action.md > "$RUNNER_TEMP/review-prompt.md"
       - uses: anthropics/claude-code-action@v1
         id: claude
+        if: steps.plan.outputs.action == 'true'
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           prompt: |
@@ -91,20 +137,32 @@ jobs:
             PR NUMBER: ${{ github.event.pull_request.number }}
 
             你是这个 PR 的审查者，没有参与写这段代码。PR 分支已经检出在当前目录。
-
-            1. 运行 `python3 .agentkit/agentkit.py context --for review`，按它列出的顺序读完项目规则和 .agentkit/review-format.md。
-            2. 用 `gh pr view ${{ github.event.pull_request.number }}` 读 PR 描述，加 `--comments` 看之前的审查；用 `gh pr diff ${{ github.event.pull_request.number }}` 读完整改动。
-            3. 自动检查的结果在 checks.md（如果存在），把它当作证据。
-            4. 按 review-format.md 的模板把结果写进 review.md，然后运行 `python3 .agentkit/agentkit.py validate review.md`，不通过就改到通过。
+            审查要求和全部材料在 ${{ runner.temp }}/review-prompt.md，先完整读完，再完全按里面的要求做。
 
             不要发评论，不要修改代码，也不要批准或拒绝 PR；评论由后面的步骤发出。
           claude_args: |
-            --max-turns 30 --allowedTools "Read,Grep,Glob,Write,Bash(python3 .agentkit/agentkit.py context:*),Bash(python3 .agentkit/agentkit.py validate:*),Bash(gh pr view:*),Bash(gh pr diff:*)"
+            --max-turns 30 --allowedTools "Read,Grep,Glob,Write,Bash(git diff:*),Bash(git show:*),Bash(git log:*),Bash(python3 .agentkit/agentkit.py validate:*)"
       - name: Explain why the AI review did not run
         if: failure() && steps.claude.outcome == 'failure'
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 .agentkit/agentkit.py explain-failure --pr "${{ github.event.pull_request.number }}" --file "$RUNNER_TEMP/claude-execution-output.json"
+      - name: Run the other reviewers and merge the results
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          # api 类型审查者从这些环境变量读 key（agentkit.toml 里的 key_env）；没配的密钥是空的，不影响别的审查者
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          python3 .agentkit/agentkit.py review --ci --base "$BASE" --evidence checks.md \
+            --pr "${{ github.event.pull_request.number }}" --pr-body-file "$RUNNER_TEMP/pr-body.md" \
+            --include claude-action=review-action.md --out review.md \
+            || echo "::warning::没有审查者产出合格的结果，交给下一步判定"
       - name: Post the review and apply the gate
         env:
           GH_TOKEN: ${{ github.token }}

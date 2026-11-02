@@ -17,7 +17,10 @@ spec.loader.exec_module(ak)
 def config(**overrides):
     cfg = {"rules_always": [], "rules_review": [], "checks_always": [], "checks_by_path": [], "timeout": 60,
            "protected": [], "high_risk": list(ak.DEFAULT_HIGH_RISK), "reviewers": {"low": 0, "medium": 1, "high": 2},
-           "requirements": "pr_body", "check_on_stop": True, "trusted_authors": ["github-actions[bot]"]}
+           "requirements": "pr_body", "check_on_stop": True, "trusted_authors": ["github-actions[bot]"],
+           "tasks_dir": "docs/tasks", "tasks_required": True, "block_before_confirm": True,
+           "instruction_files": ["CLAUDE.md"], "review_local": ["claude"], "review_ci": ["claude-action"],
+           "review_agree": 1, "review_ci_setup": [], "engines": dict(ak.DEFAULT_ENGINES)}
     cfg.update(overrides)
     return cfg
 
@@ -78,6 +81,29 @@ def toml_config(**sections):
         for key, value in values.items():
             lines.append(f"{key} = {json.dumps(value)}")
     return "\n".join(lines) + "\n"
+
+
+class TomlReaderTest(unittest.TestCase):
+    SAMPLE = ('version = 1\n[rules]\nalways = ["AGENTS.md"] # c\n[checks]\nalways = [\n  "make check",\n]\n'
+              '[[checks.by_path]]\npaths = ["web/**"]\nrun = ["npm ci --prefix web && npm test"]\n'
+              '[risk]\nreviewers = { low = 0, medium = 1, high = 2 }\n[review.engines.x]\n'
+              "run = \'\'\'\"/a b/claude\" -p --allowedTools \"Read\"\'\'\'\n"
+              'key = "a\\"b\\u4e2d"\nok = true\nratio = 1.5\n')
+
+    def test_reader_matches_tomllib(self):
+        try:
+            import tomllib
+        except ModuleNotFoundError:
+            self.skipTest("Python < 3.11")
+        self.assertEqual(ak.parse_toml(self.SAMPLE), tomllib.loads(self.SAMPLE))
+
+    def test_reader_basics(self):
+        data = ak.parse_toml(self.SAMPLE)
+        self.assertEqual(data["checks"]["by_path"][0]["paths"], ["web/**"])
+        self.assertEqual(data["review"]["engines"]["x"]["run"], '"/a b/claude" -p --allowedTools "Read"')
+        self.assertEqual(data["review"]["engines"]["x"]["key"], 'a"b中')
+        with self.assertRaises(ValueError):
+            ak.parse_toml("[a\nb = 1\n")
 
 
 class MatchingTest(unittest.TestCase):
@@ -325,9 +351,17 @@ class InitTest(unittest.TestCase):
         self.assertIn("make unit-test", (root / "agentkit.toml").read_text())
         self.assertIn("vendor/**", (root / "agentkit.toml").read_text())
         for path in (".agentkit/agentkit.py", ".agentkit/review-format.md", ".agentkit/team-workflow.md",
-                     ".claude/commands/repro.md", ".claude/commands/selfcheck.md", ".github/workflows/agentkit.yml"):
+                     ".agentkit/task-card.md", ".agentkit/prompts/restate.md", ".agentkit/prompts/reviewer.md",
+                     ".claude/commands/repro.md", ".claude/commands/selfcheck.md", ".claude/commands/handoff.md",
+                     ".github/workflows/agentkit.yml", ".git/hooks/pre-commit"):
             self.assertTrue((root / path).exists(), path)
         self.assertEqual((root / ".claude/commands/restate.md").read_text(), "my own command\n")
+        self.assertFalse((root / ".claude/commands/reviewer.md").exists())
+        agents = (root / "AGENTS.md").read_text()
+        self.assertTrue(agents.startswith("rules\n"))
+        self.assertEqual(agents.count(ak.BLOCK_START), 1)
+        self.assertIn("task show", agents)
+        self.assertIn("[tasks]", (root / "agentkit.toml").read_text())
         claude_md = (root / "CLAUDE.md").read_text()
         self.assertIn("@AGENTS.md", claude_md)
         self.assertIn("@.agentkit/team-workflow.md", claude_md)
@@ -339,9 +373,341 @@ class InitTest(unittest.TestCase):
         self.assertIn("# 手工改动", (root / "agentkit.toml").read_text())
         self.assertEqual((root / ".claude/settings.json").read_text(), settings_before)
         self.assertEqual((root / "CLAUDE.md").read_text(), claude_md)
+        self.assertEqual((root / "AGENTS.md").read_text(), agents)
         settings = json.loads(settings_before)
         self.assertEqual(len(settings["hooks"]["PreToolUse"]), 1)
         self.assertEqual(len(settings["hooks"]["Stop"]), 1)
+        self.assertEqual(len(settings["hooks"]["SessionStart"]), 1)
+        self.assertIn("Bash(python3 .agentkit/agentkit.py task confirm:*)", settings["permissions"]["deny"])
+
+    def test_other_agents_get_a_pointer_and_a_repo_without_agents_md_gets_one(self):
+        (self.repo.root / "AGENTS.md").unlink()
+        (self.repo.root / "agentkit.toml").write_text('[agents]\ninstruction_files = ["CLAUDE.md", "GEMINI.md"]\n')
+        self.init()
+        root = self.repo.root
+        self.assertIn("被纠正过的规则", (root / "AGENTS.md").read_text())
+        self.assertIn("AGENTS.md", (root / "GEMINI.md").read_text())
+        self.assertIn("@AGENTS.md", (root / "CLAUDE.md").read_text())
+
+
+CARD = """# WIP-1 下单时库存不足要提示
+
+## 需求
+
+- 满足谁：下单的用户
+- 解决什么：库存不足时现在返回 500
+- 怎么算做完：
+  - 返回 409 和“库存不足”
+- 确认：
+
+## 要人拍板的事
+
+- [x] 用 409 还是 400 → 409（产品，对话，11-01）
+- [ ] 多件商品时整单失败还是只去掉缺货的？（建议：整单失败）
+
+## 拆分
+
+1. [done] 下单接口检查库存
+2. [doing] 前端显示提示
+3. [todo] 多件商品
+
+## 交接
+
+- 做到：接口已合入
+- 下一步：结账页处理 409
+- 试过不行的：
+
+## 记录
+"""
+
+
+def signed(card=CARD, who="张三，2026-11-01"):
+    fp = ak.requirement_fingerprint(ak.card_sections(card)["需求"])
+    return ak.set_confirmation(card, f"{who}（需求指纹 {fp}）")
+
+
+class TaskCardTest(unittest.TestCase):
+    def test_status_reads_every_section(self):
+        st = ak.card_status(CARD)
+        self.assertEqual(st["title"], "WIP-1 下单时库存不足要提示")
+        self.assertEqual(st["missing"], [])
+        self.assertEqual(st["confirmed"], "no")
+        self.assertEqual(len(st["open"]), 1)
+        self.assertEqual(st["decided"], 1)
+        self.assertEqual([state for state, _ in st["steps"]], ["done", "doing", "todo"])
+        self.assertEqual(st["handoff"]["下一步"], "结账页处理 409")
+
+    def test_field_names_may_carry_a_note_or_bold(self):
+        section = "- 怎么算做完（可检查）：返回 409\n- **满足谁**：用户\n"
+        self.assertEqual(ak.field_value(section, "怎么算做完"), "返回 409")
+        self.assertEqual(ak.field_value(section, "满足谁"), "用户")
+
+    def test_a_bold_sign_off_line_is_one_line_everywhere(self):
+        card = CARD.replace("- 确认：", "- **确认**（人填）：")
+        out = signed(card)
+        self.assertEqual(out.count("确认"), card.count("确认"))  # replaced in place, not appended
+        self.assertEqual(ak.card_status(out)["confirmed"], "yes")
+
+    def test_missing_fields_and_indented_values(self):
+        st = ak.card_status(CARD.replace("- 满足谁：下单的用户", "- 满足谁："))
+        self.assertEqual(st["missing"], ["满足谁"])
+        self.assertIn("409", ak.field_value(ak.card_sections(CARD)["需求"], "怎么算做完"))
+
+    def test_sign_off_goes_stale_when_the_requirement_changes(self):
+        card = signed()
+        st = ak.card_status(card)
+        self.assertEqual(st["confirmed"], "yes")
+        self.assertEqual(st["confirmed_by"], "张三，2026-11-01")
+        self.assertEqual(ak.card_status(card.replace("返回 409", "返回 400"))["confirmed"], "stale")
+        self.assertEqual(ak.card_status(card.replace("- 做到：接口已合入", "- 做到：都做完了"))["confirmed"], "yes")
+
+    def test_comments_do_not_count(self):
+        card = CARD.replace("## 拆分\n", "## 拆分\n\n<!-- 1. [todo] 例子 -->\n")
+        self.assertEqual(len(ak.card_status(card)["steps"]), 3)
+
+    def test_append_to_section(self):
+        out = ak.append_to_section(CARD, "记录", "- 一行")
+        self.assertTrue(out.rstrip().endswith("- 一行"))
+        out = ak.append_to_section(CARD, "要人拍板的事", "- [ ] 新问题")
+        self.assertEqual(len(ak.card_status(out)["open"]), 2)
+
+
+class TaskCommandTest(unittest.TestCase):
+    def setUp(self):
+        self.repo = TempRepo({"agentkit.toml": toml_config(tasks={"dir": "docs/tasks", "required": True}),
+                              "shop/orders.py": "x = 1\n"})
+
+    def tearDown(self):
+        self.repo.close()
+
+    def test_new_show_list_and_use(self):
+        created = self.repo.run("task", "new", "WIP-1", "下单库存不足")
+        self.assertEqual(created.returncode, 0, created.stderr)
+        card = self.repo.root / "docs/tasks/WIP-1.md"
+        self.assertTrue(card.exists())
+        self.assertNotIn(ak.OWNED, card.read_text())
+        self.assertIn("# WIP-1 下单库存不足", card.read_text())
+        shown = self.repo.run("task", "show")
+        self.assertIn("还缺", shown.stdout)
+        self.assertIn("还没有", shown.stdout)
+        self.assertIn("除了这张任务卡", shown.stdout)
+        self.assertEqual(self.repo.run("task", "new", "WIP-1").returncode, 1)
+        self.assertEqual(self.repo.run("task", "new", "bad id").returncode, 1)
+        self.repo.run("task", "use", "--clear")
+        self.assertIn("这个分支改过的任务卡", self.repo.run("task", "show").stdout)
+        self.repo.git("add", "-A")
+        self.repo.git("commit", "-qm", "card")
+        self.assertIn("没有找到当前任务", self.repo.run("task", "show").stdout)
+        self.repo.git("checkout", "-q", "-b", "yukang/WIP-1-stock")
+        self.assertIn("分支名", self.repo.run("task", "show", "--brief").stdout)
+        self.assertIn("WIP-1", self.repo.run("task", "list").stdout)
+
+    def test_confirm_refuses_agents(self):
+        self.repo.write({"docs/tasks/WIP-1.md": CARD})
+        refused = self.repo.run("task", "confirm", "WIP-1")
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("由人", refused.stderr)
+
+    def test_handoff_needs_the_handoff_written(self):
+        self.repo.write({"docs/tasks/WIP-1.md": CARD.replace("- 下一步：结账页处理 409", "- 下一步：")})
+        self.assertEqual(self.repo.run("task", "handoff", "WIP-1").returncode, 1)
+        self.repo.write({"docs/tasks/WIP-1.md": CARD})
+        done = self.repo.run("task", "handoff", "WIP-1", "--agent", "Kimi")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        text = (self.repo.root / "docs/tasks/WIP-1.md").read_text()
+        self.assertIn("· Kimi ·", text)
+        self.assertIn("拆分完成 1/3", text)
+
+    def test_check_for_a_pr(self):
+        self.repo.git("checkout", "-q", "-b", "feature")
+        self.repo.write({"shop/orders.py": "x = 2\n"})
+        self.repo.git("commit", "-qam", "code only")
+        no_card = self.repo.run("task", "check", "--base", "main", "--committed-only")
+        self.assertEqual(no_card.returncode, 1)
+        self.assertIn("找不到任务卡", no_card.stdout)
+
+        self.repo.write({"docs/tasks/WIP-1.md": CARD})
+        self.repo.git("add", "-A")
+        self.repo.git("commit", "-qm", "card")
+        unsigned = self.repo.run("task", "check", "--base", "main", "--committed-only")
+        self.assertEqual(unsigned.returncode, 1)
+        self.assertIn("还没有人确认", unsigned.stdout)
+
+        self.repo.write({"docs/tasks/WIP-1.md": signed()})
+        self.repo.git("commit", "-qam", "sign off")
+        ok = self.repo.run("task", "check", "--base", "main", "--committed-only")
+        self.assertEqual(ok.returncode, 0, ok.stdout)
+        self.assertIn("还有 1 件事没拍板", ok.stdout)
+
+    def test_check_finds_the_card_from_the_pr_body_and_warns_on_stale_handoff(self):
+        self.repo.write({"docs/tasks/WIP-1.md": signed()})
+        self.repo.git("add", "-A")
+        self.repo.git("commit", "-qm", "card on main")
+        self.repo.git("checkout", "-q", "-b", "feature")
+        self.repo.write({"shop/orders.py": "x = 2\n", "body.md": "任务：WIP-1\n"})
+        self.repo.git("add", "shop")
+        self.repo.git("commit", "-qm", "code")
+        result = self.repo.run("task", "check", "--base", "main", "--committed-only", "--pr-body-file", "body.md")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("任务卡没有更新", result.stdout)
+
+    def test_not_required_only_warns(self):
+        self.repo.write({"agentkit.toml": toml_config(tasks={"required": False})})
+        self.repo.git("commit", "-qam", "relax")
+        self.repo.git("checkout", "-q", "-b", "feature")
+        self.repo.write({"shop/orders.py": "x = 2\n"})
+        self.repo.git("commit", "-qam", "code")
+        result = self.repo.run("task", "check", "--base", "main", "--committed-only")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("提醒", result.stdout)
+
+
+class TaskHookTest(unittest.TestCase):
+    def setUp(self):
+        self.repo = TempRepo({"agentkit.toml": toml_config(tasks={"dir": "docs/tasks"}),
+                              "shop/orders.py": "x = 1\n", "docs/tasks/WIP-1.md": CARD})
+        self.repo.run("task", "use", "WIP-1")
+        self.env = {**env_without_hook_dir(), "CLAUDE_PROJECT_DIR": str(self.repo.root)}
+
+    def tearDown(self):
+        self.repo.close()
+
+    def hook(self, event, payload=None):
+        return self.repo.run("hook", event, stdin=json.dumps(payload or {}), env=self.env)
+
+    def edit(self, rel, **tool_input):
+        return self.hook("pre-edit", {"tool_name": "Edit", "tool_input": {"file_path": str(self.repo.root / rel), **tool_input}})
+
+    def test_agents_cannot_sign_off(self):
+        blocked = self.edit("docs/tasks/WIP-1.md", old_string="- 确认：", new_string="- 确认：我自己")
+        self.assertEqual(blocked.returncode, 2)
+        self.assertIn("只能由人", blocked.stderr)
+        allowed = self.edit("docs/tasks/WIP-1.md", old_string="- 做到：接口已合入", new_string="- 做到：前端也好了")
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+
+    def test_no_code_edits_before_sign_off(self):
+        blocked = self.hook("pre-edit", {"tool_name": "Write", "tool_input": {"file_path": str(self.repo.root / "shop/orders.py"), "content": "x = 2\n"}})
+        self.assertEqual(blocked.returncode, 2)
+        self.assertIn("还没有人确认", blocked.stderr)
+        self.repo.write({"docs/tasks/WIP-1.md": signed()})
+        self.assertEqual(self.edit("shop/orders.py", old_string="x = 1", new_string="x = 2").returncode, 0)
+
+    def test_stop_asks_for_a_handoff_and_session_start_shows_the_card(self):
+        self.repo.write({"docs/tasks/WIP-1.md": signed()})
+        self.repo.git("commit", "-qam", "sign off")
+        self.repo.write({"shop/orders.py": "x = 2\n"})
+        stop = self.hook("stop")
+        self.assertEqual(stop.returncode, 2)
+        self.assertIn("交接", stop.stderr)
+        self.repo.write({"docs/tasks/WIP-1.md": signed() + "\n- 更新\n"})
+        self.assertEqual(self.hook("stop").returncode, 0)
+        start = self.hook("session-start")
+        self.assertEqual(start.returncode, 0)
+        self.assertIn("当前任务：WIP-1", start.stdout)
+
+    def test_guards_fail_closed_when_the_kit_breaks(self):
+        self.repo.write({"agentkit.toml": "[tasks\n"})
+        broken = self.hook("pre-edit", {"tool_name": "Write", "tool_input": {"file_path": str(self.repo.root / "x.py"), "content": ""}})
+        self.assertEqual(broken.returncode, 2)
+        self.assertIn("自己出错了", broken.stderr)
+        self.assertEqual(self.hook("stop").returncode, 0)
+
+    def test_git_pre_commit_blocks_unsigned_code(self):
+        self.repo.write({"shop/orders.py": "x = 2\n"})
+        self.repo.git("add", "shop/orders.py")
+        blocked = self.repo.run("hook", "pre-commit")
+        self.assertEqual(blocked.returncode, 1)
+        self.repo.write({"docs/tasks/WIP-1.md": signed()})
+        self.assertEqual(self.repo.run("hook", "pre-commit").returncode, 0)
+        self.assertIn("已安装", self.repo.run("hook", "install-git").stdout)
+        self.assertTrue((self.repo.root / ".git/hooks/pre-commit").exists())
+
+
+class PromptTest(unittest.TestCase):
+    def setUp(self):
+        self.repo = TempRepo({"agentkit.toml": "", "docs/tasks/WIP-1.md": CARD})
+
+    def tearDown(self):
+        self.repo.close()
+
+    def test_prompts_work_for_any_agent(self):
+        listing = self.repo.run("prompt")
+        for name in ("restate", "repro", "handoff", "start"):
+            self.assertIn(name, listing.stdout)
+        out = self.repo.run("prompt", "restate", "下单时库存不足要提示").stdout
+        self.assertIn("下单时库存不足要提示", out)
+        self.assertNotIn("$ARGUMENTS", out)
+        self.assertNotIn(ak.OWNED, out)
+        self.repo.run("task", "use", "WIP-1")
+        self.assertIn("当前任务卡", self.repo.run("prompt", "start", "接着做").stdout)
+        self.assertNotIn("当前任务卡", self.repo.run("prompt", "start", "--no-card").stdout)
+
+
+def fake_review(risk, issues, name="x"):
+    return as_comment(review(risk, issues)).replace("## AI 审查", f"## AI 审查（{name}）")
+
+
+class ReviewEngineTest(unittest.TestCase):
+    def test_merge_takes_max_risk_min_scores_and_keeps_every_issue(self):
+        a = review("low", [issue()])
+        b = review("high", [issue("nit")])
+        b["scores"]["evidence"] = 2
+        text, merged = ak.merge_reviews([("claude", as_comment(a), a), ("deepseek", as_comment(b), b)], [], [], 1)
+        self.assertEqual(merged["risk_level"], "high")
+        self.assertEqual(merged["scores"]["evidence"], 2)
+        self.assertEqual(merged["reviewers"], ["claude", "deepseek"])
+        self.assertEqual(len(merged["issues"]), 2)
+        self.assertIn("2 位独立审查者", text)
+        self.assertIn("claude、deepseek", text)  # same spot, grouped
+
+    def test_agree_needs_several_reviewers_to_block(self):
+        a = review("low", [issue()])
+        b = review("low", [])
+        _, merged = ak.merge_reviews([("a", "", a), ("b", "", b)], [], [], 2)
+        self.assertFalse(ak.decide(config(), merged, ak.risk_floor(config(), []), 0)["blockers"])
+        b = review("low", [{**issue(), "line": 3}])
+        _, merged = ak.merge_reviews([("a", "", review("low", [issue()])), ("b", "", b)], [], [], 2)
+        self.assertEqual(len(ak.decide(config(), merged, ak.risk_floor(config(), []), 0)["blockers"]), 2)
+
+    def test_instances_and_plan(self):
+        self.assertEqual(ak.review_instances(["claude", "claude", "codex"]),
+                         [("claude#1", "claude"), ("claude#2", "claude"), ("codex", "codex")])
+
+    def test_command_engines_run_independently_and_merge(self):
+        result = json.dumps(review("medium", [issue()]))
+        script = f"import sys; sys.stdin.read(); print('## AI 审查\\n\\n正文\\n\\n<!-' + '- ai-review-result\\n' + {result!r} + '\\n-' + '->')"
+        bad = "import sys; sys.stdin.read(); print('没有结果')"
+        engines = ('[review]\nlocal = ["good", "good", "bad"]\n'
+                   f'[review.engines.good]\ntype = "command"\nrun = {json.dumps(sys.executable + " -c " + json.dumps(script))}\n'
+                   f'[review.engines.bad]\ntype = "command"\nrun = {json.dumps(sys.executable + " -c " + json.dumps(bad))}\n')
+        repo = TempRepo({"agentkit.toml": engines, "src/a.py": "x = 1\n"})
+        try:
+            repo.git("checkout", "-q", "-b", "feature")
+            repo.write({"src/a.py": "x = 2\n"})
+            out = repo.run("review", "--base", "main")
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            self.assertIn("good#1：完成", out.stdout)
+            self.assertIn("bad：结果格式不对", out.stdout)
+            self.assertIn("没有结果", (repo.root / ".agentkit/review.bad.local.md").read_text())
+            merged, errors = ak.parse_result((repo.root / ".agentkit/review.local.md").read_text())
+            self.assertEqual(errors, [])
+            self.assertEqual(merged["reviewers"], ["good#1", "good#2"])
+            self.assertEqual(merged["failed_reviewers"], ["bad"])
+            prompt = repo.run("review", "--print-prompt", "--base", "main").stdout
+            self.assertIn("x = 2", prompt)
+            self.assertIn("审查格式", prompt)
+            plan = repo.run("review", "--ci", "--plan").stdout
+            self.assertIn("action=true", plan)
+        finally:
+            repo.close()
+
+    def test_api_engine_reports_a_missing_key(self):
+        text, error = "", ""
+        try:
+            ak.run_api_engine({"type": "api", "base_url": "http://127.0.0.1:9", "model": "m", "key_env": "AGENTKIT_TEST_NO_KEY"}, "p", 5)
+        except RuntimeError as e:
+            error = str(e)
+        self.assertIn("AGENTKIT_TEST_NO_KEY", error)
 
 
 if __name__ == "__main__":

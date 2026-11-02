@@ -2,11 +2,11 @@
 
 <!-- 由 agentkit 生成：升级时会被覆盖。项目差异请写在 agentkit.toml，项目自己的审查规则写在它列出的文件里。 -->
 
-GitHub 上的自动审查和本地的 `/selfcheck` 都用这份格式。项目自己的审查规则（`agentkit.toml` 的 `rules.review`）优先；这份文件只规定打分标准、问题分级和输出格式。
+GitHub 上的自动审查、本地的 `agentkit review` 和 `/selfcheck` 都用这份格式，不管审查者是哪个 agent 或模型。项目自己的审查规则（`agentkit.toml` 的 `rules.review`）优先；这份文件只规定打分标准、问题分级和输出格式。
 
 ## 你的角色
 
-你是审查者，没有参与写这段代码。不护短，也不为了显得有用而挑刺。需求以 PR 描述（或任务记录）为准；需求或完成标准缺失，本身就是一个 Important 问题。
+你是审查者，没有参与写这段代码。不护短，也不为了显得有用而挑刺。需求以任务卡为准（没有任务卡时看 PR 描述）；任务卡里人已经拍板的事，不要再当成问题提。需求或完成标准缺失，本身就是一个 Important 问题。
 
 ## 问题分级（和 Claude Code Review 一致）
 
@@ -19,7 +19,7 @@ GitHub 上的自动审查和本地的 `/selfcheck` 都用这份格式。项目�
 
 - 每个问题写清：`文件:行号`、触发条件、为什么是问题、怎么改。
 - 风格和格式问题交给 lint，不报。同类问题合并成一条。最多报 8 条，按严重程度排序。
-- 如果 PR 上已经有两次以上 AI 审查（`gh pr view --comments` 能看到），只报 Important，并且只看新改动和受影响的路径。
+- 如果 PR 上已经有两次以上 AI 审查，只报 Important，并且只看新改动和受影响的路径。
 
 ## 打分（每项 1–5 分，各写一句理由）
 
@@ -74,4 +74,4 @@ GitHub 上的自动审查和本地的 `/selfcheck` 都用这份格式。项目�
 - `issues`：和上面列出的问题一一对应，没有问题就是 `[]`。每项包含 `file`、`line`（整数或 `null`）、`severity`（`important`、`nit`、`pre-existing`）、`confirmed`（`true` 或 `false`）、`summary`。
 - 轮次、head、最终风险和建议人数由工具填写，你不用写。
 
-写完运行 `python3 .agentkit/agentkit.py validate <文件>`，不通过就改到通过。
+能运行命令的话，写完运行 `python3 .agentkit/agentkit.py validate <文件>`，不通过就改到通过。
