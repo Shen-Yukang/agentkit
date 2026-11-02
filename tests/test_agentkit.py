@@ -366,6 +366,10 @@ class InitTest(unittest.TestCase):
         self.assertIn("@AGENTS.md", claude_md)
         self.assertIn("@.agentkit/team-workflow.md", claude_md)
         self.assertIn(".agentkit/*.local.md", (root / ".gitignore").read_text())
+        version = (root / ".agentkit/VERSION").read_text()
+        self.assertTrue(version.startswith(ak.VERSION + "\n"))
+        import hashlib
+        self.assertIn("sha256: " + hashlib.sha256((root / ".agentkit/agentkit.py").read_bytes()).hexdigest(), version)
 
         (root / "agentkit.toml").write_text((root / "agentkit.toml").read_text() + "# 手工改动\n")
         settings_before = (root / ".claude/settings.json").read_text()
@@ -707,15 +711,16 @@ class RoundTwoFixesTest(unittest.TestCase):
         finally:
             repo.close()
 
-    def test_a_branch_naming_the_requirement_finds_its_only_card(self):
-        repo = TempRepo({"agentkit.toml": "", "docs/tasks/WIP-7-2.md": CARD.replace("WIP-1", "WIP-7-2")})
+    def test_a_new_tasks_branch_never_reuses_another_tasks_card(self):
+        # Round 3: a sibling Task's branch must not pick up WIP-7-2's sign-off.
+        repo = TempRepo({"agentkit.toml": "", "docs/tasks/WIP-7-2.md": CARD.replace("WIP-1", "WIP-7-2"),
+                         "docs/tasks/WIP-7.md": CARD.replace("WIP-1", "WIP-7")})
         try:
-            repo.git("checkout", "-q", "-b", "me/feat/WIP-7-search")
-            self.assertEqual(ak.current_task(repo.root, ak.load_config(repo.root))[0], "WIP-7-2")
-            repo.write({"docs/tasks/WIP-7-1.md": CARD})
-            repo.git("add", "-A")
-            repo.git("commit", "-qm", "second card")
+            repo.git("checkout", "-q", "-b", "me/feat/WIP-7-3-search")
             self.assertIsNone(ak.current_task(repo.root, ak.load_config(repo.root), base="HEAD")[0])
+            self.assertEqual(ak.ids_in("me/feat/WIP-7-3-search", ["WIP-7", "WIP-7-3", "WIP-7-2"]), ["WIP-7-3"])
+            self.assertEqual(ak.ids_in("me/feat/WIP-7-2-search", ["WIP-7-2"]), ["WIP-7-2"])
+            self.assertEqual(ak.ids_in("任务：WIP-7。", ["WIP-7"]), ["WIP-7"])
         finally:
             repo.close()
 

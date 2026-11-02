@@ -42,7 +42,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 OWNED = "由 agentkit 生成"  # files carrying this text belong to the kit and are replaced on upgrade
 RESULT_RE = re.compile(r"<!--\s*ai-review-result\s*(.*?)\s*-->", re.S)
 RISK_ORDER = ["low", "medium", "high"]
@@ -642,7 +642,8 @@ def card_files(cfg: dict, files: list[str]) -> list[str]:
 
 
 def ids_in(text: str, ids: list[str]) -> list[str]:
-    return [i for i in ids if re.search(rf"(?<![A-Za-z0-9]){re.escape(i)}(?![A-Za-z0-9])", text)]
+    """Task ids named in text. WIP-16 is not named by "WIP-16-3-x": a -<digit> after it makes a different id."""
+    return [i for i in ids if re.search(rf"(?<![A-Za-z0-9]){re.escape(i)}(?![A-Za-z0-9])(?!-[0-9])", text)]
 
 
 def current_task(root: Path, cfg: dict, explicit: str | None = None, base: str | None = None) -> tuple[str | None, str]:
@@ -659,10 +660,6 @@ def current_task(root: Path, cfg: dict, explicit: str | None = None, base: str |
         hit = ids_in(branch, ids)
         if len(hit) == 1:
             return hit[0], f"分支名 {branch}"
-        if not hit:  # e.g. branch names WIP-16 and the only card under it is WIP-16-2
-            family = [i for i in ids if "-" in i and ids_in(branch, [i.rsplit("-", 1)[0]])]
-            if len(family) == 1:
-                return family[0], f"分支名 {branch}（同一需求下唯一的任务卡）"
         changed = [Path(f).stem for f in card_files(cfg, changed_files(root, base or default_base(root)))]
     except subprocess.CalledProcessError:
         return None, ""
@@ -1451,6 +1448,18 @@ def ensure_lines(path: Path, needed: list[str], header: str) -> list[str]:
     return missing
 
 
+def version_record() -> str:
+    """Kit version, the kit repository commit it came from (when known), and the script's digest."""
+    lines = [VERSION]
+    source = subprocess.run(["git", "-C", str(KIT_DIR), "rev-parse", "HEAD"], capture_output=True, text=True)
+    if source.returncode == 0:
+        dirty = subprocess.run(["git", "-C", str(KIT_DIR), "status", "--porcelain", "--", "agentkit.py", "templates"],
+                               capture_output=True, text=True).stdout.strip()
+        lines.append(f"source: {source.stdout.strip()}" + ("（含未提交的改动）" if dirty else ""))
+    lines.append("sha256: " + hashlib.sha256(Path(__file__).resolve().read_bytes()).hexdigest())
+    return "\n".join(lines) + "\n"
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     templates = KIT_DIR / "templates"
     if not templates.is_dir():
@@ -1470,7 +1479,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     kit = root / ".agentkit"
     kit.mkdir(exist_ok=True)
     shutil.copyfile(Path(__file__).resolve(), kit / "agentkit.py")
-    (kit / "VERSION").write_text(VERSION + "\n")
+    (kit / "VERSION").write_text(version_record())
     for name in ("review-format.md", "team-workflow.md", "task-card.md"):
         write_owned(templates / name, kit / name, report)
     for src in sorted((templates / "prompts").glob("*.md")):
