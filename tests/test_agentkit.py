@@ -640,6 +640,10 @@ class TaskHookTest(unittest.TestCase):
         blocked = self.repo.run("hook", "pre-commit")
         self.assertEqual(blocked.returncode, 1)
         self.repo.write({"docs/tasks/WIP-1.md": signed()})
+        not_staged = self.repo.run("hook", "pre-commit")  # signed in the working tree only: the commit would carry the unsigned card
+        self.assertEqual(not_staged.returncode, 1)
+        self.assertIn("暂存区", not_staged.stderr)
+        self.repo.git("add", "docs/tasks/WIP-1.md")
         self.assertEqual(self.repo.run("hook", "pre-commit").returncode, 0)
         self.assertIn("已安装", self.repo.run("hook", "install-git").stdout)
         self.assertTrue((self.repo.root / ".git/hooks/pre-commit").exists())
@@ -724,6 +728,23 @@ class ReviewEngineTest(unittest.TestCase):
             self.assertIn("审查格式", prompt)
             plan = repo.run("review", "--ci", "--plan").stdout
             self.assertIn("action=true", plan)
+        finally:
+            repo.close()
+
+    def test_review_prompt_covers_every_card_new_files_and_head_scope(self):
+        repo = TempRepo({"agentkit.toml": "", "docs/tasks/WIP-1.md": CARD, "docs/tasks/WIP-2.md": CARD.replace("WIP-1", "WIP-2")})
+        try:
+            repo.git("checkout", "-q", "-b", "feature")
+            repo.write({"docs/tasks/WIP-1.md": CARD + "\n", "docs/tasks/WIP-2.md": CARD.replace("WIP-1", "WIP-2") + "\n"})
+            repo.write({f"new/f{i:02}.txt": "x\n" for i in range(12)})
+            prompt = repo.run("review", "--print-prompt", "--base", "main").stdout
+            self.assertIn("任务卡（docs/tasks/WIP-1.md）", prompt)
+            self.assertIn("任务卡（docs/tasks/WIP-2.md）", prompt)
+            self.assertIn("没有附上内容", prompt)
+            self.assertIn("- new/f11.txt", prompt)
+            head = repo.run("review", "--print-prompt", "--base", "HEAD").stdout
+            self.assertIn("还没提交的", head)
+            self.assertNotIn("HEAD...HEAD", head)
         finally:
             repo.close()
 

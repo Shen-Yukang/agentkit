@@ -1101,10 +1101,15 @@ def hook_pre_commit(root: Path, cfg: dict) -> int:
     if not task_id:
         print(f"agentkit 提醒：这次提交改了代码，但没有当前任务卡（`{CLI} task show`）。", file=sys.stderr)
         return 0
-    if card_status(card_path(root, cfg, task_id).read_text())["confirmed"] != "yes":
-        print(f"agentkit：任务 {task_id} 的需求还没有人确认（或确认后又改过），先不提交代码。"
-              f"请人运行 `{CLI} task confirm {task_id}`；如果这次提交不属于这个任务，运行 `{CLI} task use --clear`。",
-              file=sys.stderr)
+    rel = os.path.relpath(card_path(root, cfg, task_id), root).replace(os.sep, "/")
+    committed = subprocess.run(["git", "-C", str(root), "show", f":{rel}"], capture_output=True, text=True)
+    if committed.returncode != 0:
+        print(f"agentkit：任务卡 {rel} 还没有加入 git，先运行 `git add {rel}`，和代码一起提交。", file=sys.stderr)
+        return 1
+    if card_status(committed.stdout)["confirmed"] != "yes":
+        print(f"agentkit：要提交的任务卡（暂存区里的 {rel}）显示任务 {task_id} 的需求还没有人确认（或确认后又改过），先不提交代码。"
+              f"请人运行 `{CLI} task confirm {task_id}`，再 `git add {rel}`；"
+              f"如果这次提交不属于这个任务，运行 `{CLI} task use --clear`。", file=sys.stderr)
         return 1
     return 0
 
@@ -1721,14 +1726,22 @@ def read_limited(path: Path, limit: int) -> str:
 
 def review_diff(root: Path, base: str, committed_only: bool) -> str:
     if base == "HEAD":
-        return git(root, "diff", "HEAD")
-    merge_base = git(root, "merge-base", base, "HEAD").strip()
-    diff = git(root, "diff", merge_base, "HEAD") if committed_only else git(root, "diff", merge_base)
+        diff = git(root, "diff", "HEAD")
+    else:
+        merge_base = git(root, "merge-base", base, "HEAD").strip()
+        diff = git(root, "diff", merge_base, "HEAD") if committed_only else git(root, "diff", merge_base)
     if not committed_only:
-        for name in git(root, "ls-files", "--others", "--exclude-standard").split()[:10]:
+        shown, skipped = 0, []
+        for name in git(root, "ls-files", "--others", "--exclude-standard").splitlines():
             path = root / name
-            if path.is_file() and path.stat().st_size < 20_000:
+            if shown < 10 and path.is_file() and path.stat().st_size < 20_000:
                 diff += f"\n新文件（还没加入 git）：{name}\n```\n{path.read_text(errors='ignore')}\n```\n"
+                shown += 1
+            else:
+                skipped.append(name)
+        if skipped:
+            diff += ("\n还没加入 git 的新文件里，下面这些没有附上内容（超过 10 个，或单个超过 20KB）；"
+                     "能运行命令的话自己读：\n" + "\n".join(f"- {n}" for n in skipped) + "\n")
     if len(diff) > MAX_DIFF_CHARS:
         diff = diff[:MAX_DIFF_CHARS] + f"\n\n（diff 太长，后面 {len(diff) - MAX_DIFF_CHARS} 个字符已截断；能运行命令的话自己看完整改动）"
     return diff
@@ -1741,7 +1754,10 @@ def build_review_prompt(root: Path, cfg: dict, base: str, evidence: str | None =
                   "不通过就改到通过。不要修改其他文件。")
     else:
         finish = "不要修改任何文件。把完整结果作为你的最终回复直接输出，前后不要加别的话。"
-    if committed_only or base == "HEAD":
+    if base == "HEAD":
+        scope = "工作区里**还没提交的**改动（相对 HEAD，包括新文件）"
+        diff_cmd = "git diff HEAD`（看工作区）和 `git status"
+    elif committed_only:
         scope, diff_cmd = f"`{base}...HEAD`（已提交的改动）", f"git diff {base}...HEAD"
     else:
         merge_base = git(root, "merge-base", base, "HEAD").strip()
@@ -1754,16 +1770,19 @@ def build_review_prompt(root: Path, cfg: dict, base: str, evidence: str | None =
         if (root / rule).is_file():
             parts.append(f"## 项目规则：{rule}\n\n" + read_limited(root / rule, MAX_RULE_CHARS))
     parts.append("## 审查格式\n\n" + strip_comments(kit_file("review-format.md").read_text()).strip())
-    task_id, _ = current_task(root, cfg, base=base)
-    if task_id:
+    files = changed_files(root, base, worktree=not committed_only)
+    cards = [Path(f).stem for f in card_files(cfg, files) if (root / f).is_file()]
+    if not cards:
+        task_id, _ = current_task(root, cfg, base=base)
+        cards = [task_id] if task_id else []
+    for task_id in cards:
         parts.append(f"## 任务卡（{cfg['tasks_dir']}/{task_id}.md）\n\n" + card_path(root, cfg, task_id).read_text().strip())
-    else:
+    if not cards:
         parts.append("## 任务卡\n\n没有找到任务卡。需求以 PR 描述为准；需求或完成标准缺失，本身就是一个 Important 问题。")
     if pr_body.strip():
         parts.append("## PR 描述\n\n" + pr_body.strip())
     if evidence and Path(evidence).exists():
         parts.append("## 自动检查结果\n\n" + Path(evidence).read_text().strip())
-    files = changed_files(root, base, worktree=not committed_only)
     parts.append(f"## 改动的文件（{len(files)} 个）\n\n" + "\n".join(f"- {f}" for f in files))
     parts.append("## 完整改动（diff）\n\n```diff\n" + review_diff(root, base, committed_only) + "\n```")
     return "\n\n---\n\n".join(parts) + "\n"
