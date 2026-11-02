@@ -55,7 +55,7 @@ HOOK_PRE = 'python3 "$CLAUDE_PROJECT_DIR/.agentkit/agentkit.py" hook pre-edit'
 HOOK_STOP = 'python3 "$CLAUDE_PROJECT_DIR/.agentkit/agentkit.py" hook stop'
 HOOK_START = 'python3 "$CLAUDE_PROJECT_DIR/.agentkit/agentkit.py" hook session-start'
 CLI = "python3 .agentkit/agentkit.py"  # how agents and people call the kit inside a repository
-POINTER = ".agentkit/current-task.local.md"  # this clone's current task id; ignored by git
+POINTER = ".agentkit/current-task.local.md"  # this clone's current task id and its branch; ignored by git
 TASK_FIELDS = ("满足谁", "解决什么", "怎么算做完")
 HANDOFF_FIELDS = ("做到", "下一步", "试过不行的")
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -645,11 +645,11 @@ def current_task(root: Path, cfg: dict, explicit: str | None = None, base: str |
     if explicit:
         task_id = Path(explicit).stem if explicit.endswith(".md") else explicit
         return (task_id, "命令行指定") if task_id in ids else (None, f"找不到任务卡 {cfg['tasks_dir']}/{task_id}.md")
-    pointer = root / POINTER
-    if pointer.exists() and pointer.read_text().strip() in ids:
-        return pointer.read_text().strip(), "当前任务（task new / task use 设置的）"
     try:
-        branch = git(root, "rev-parse", "--abbrev-ref", "HEAD").strip()
+        branch = current_branch(root)
+        pointed = read_pointer(root)
+        if pointed and pointed[0] in ids and pointed[1] in ("", branch):
+            return pointed[0], "当前任务（task new / task use 设置的）"
         hit = ids_in(branch, ids)
         if len(hit) == 1:
             return hit[0], f"分支名 {branch}"
@@ -720,13 +720,29 @@ def detect_agent() -> str:
     return "未注明 agent"
 
 
+def current_branch(root: Path) -> str:
+    try:
+        return git(root, "rev-parse", "--abbrev-ref", "HEAD").strip()
+    except subprocess.CalledProcessError:
+        return ""
+
+
+def read_pointer(root: Path) -> tuple[str, str] | None:
+    """(task id, branch it was set on). The pointer only counts on that branch, so a switch of branch drops it."""
+    pointer = root / POINTER
+    if not pointer.exists():
+        return None
+    lines = pointer.read_text().split()
+    return (lines[0], lines[1] if len(lines) > 1 else "") if lines else None
+
+
 def set_pointer(root: Path, task_id: str | None) -> None:
     pointer = root / POINTER
     if task_id is None:
         pointer.unlink(missing_ok=True)
         return
     pointer.parent.mkdir(parents=True, exist_ok=True)
-    pointer.write_text(task_id + "\n")
+    pointer.write_text(f"{task_id}\n{current_branch(root)}\n")
 
 
 def task_new(root: Path, cfg: dict, args: argparse.Namespace) -> int:

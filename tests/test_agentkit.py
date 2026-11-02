@@ -493,6 +493,13 @@ class TaskCommandTest(unittest.TestCase):
         self.assertIn("除了这张任务卡", shown.stdout)
         self.assertEqual(self.repo.run("task", "new", "WIP-1").returncode, 1)
         self.assertEqual(self.repo.run("task", "new", "bad id").returncode, 1)
+        self.repo.git("add", "-A")
+        self.repo.git("commit", "-qm", "card")
+        self.repo.git("checkout", "-q", "-b", "other")
+        self.assertIn("没有找到当前任务", self.repo.run("task", "show").stdout)  # pointer was set on main
+        self.repo.git("checkout", "-q", "main")
+        self.assertIn("task new / task use", self.repo.run("task", "show").stdout)
+        self.repo.git("reset", "-q", "--soft", "HEAD~1")
         self.repo.run("task", "use", "--clear")
         self.assertIn("这个分支改过的任务卡", self.repo.run("task", "show").stdout)
         self.repo.git("add", "-A")
